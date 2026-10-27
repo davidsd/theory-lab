@@ -1,21 +1,29 @@
 # theory-lab
 
-A startup kit for running a research lab of AI agents on one cloud machine: a director that looks after
-all projects, a lead per project, and workers, explorers and verifiers that each take one task. The
-agents are Claude Code and OpenAI Codex sessions. They coordinate through GitHub issues and files, check
-each other's results, pace themselves to your subscriptions' limits, and can use an HPC cluster within
-budgets you set. You (the PI) steer from your phone or laptop: you approve charters, answer questions in
-your GitHub inbox, and get a push notification only when something really needs you.
+A startup kit for running a research lab of AI agents on a cloud machine.
+
+## Usage (for humans)
+
+Paste the url of this repo into Claude code or Codex and tell it you want something like this. Discuss the setup you want and let it walk you through the steps.
+
+## What is a "theory lab"?
+
+A lab consists of a director that looks after all projects, a lead per project, and workers, explorers and
+verifiers that each take one task. The agents are Claude Code and OpenAI Codex sessions. They coordinate
+through GitHub issues and files, check each other's results, pace themselves to your subscriptions' limits,
+and can use an HPC cluster within budgets you set. You (the PI) steer from your phone or laptop: you approve
+charters, answer questions in your GitHub inbox, and get a push notification only when something really needs you.
 
 It was built for theoretical physics (derivations, numerics, high-precision optimization, cluster runs),
 but nothing in it is specific to one field.
 
-> **Not for wide-scale or untrusted use.** This kit is for one PI with a few trusted collaborators, on a
-> dedicated machine. Read [Security model and limits](#security-model-and-limits) before setting it up.
+**Not for wide-scale or untrusted use.** This kit is for one PI with a few trusted collaborators, on adedicated machine. Read [Security model and limits](#security-model-and-limits) before setting it up.
 
 **To set one up, follow [SETUP.md](SETUP.md).** To change providers (another cloud, GitLab, other
 models, another scheduler), see [docs/ADAPTING.md](docs/ADAPTING.md); it is written so that an AI agent
 can do the adaptation for you.
+
+**Disclaimer:** This kit is entirely vibe-coded.
 
 ## Security model and limits
 
