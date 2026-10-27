@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Start an agent in a new window of this account's tmux session "agents":
+#   new-agent <name> [folder] [claude|codex] [arguments for the agent...]
+# The folder defaults to ~/work/<name> and the agent to claude. Examples:
+#   new-agent fit
+#   new-agent notes ~/work/notes codex
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+fi
+name=$1
+folder=${2:-$HOME/work/$name}
+tool=${3:-claude}
+shift $(( $# < 3 ? $# : 3 ))
+
+if [[ ! $name =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "Use only letters, digits, - and _ in the name." >&2
+  exit 1
+fi
+tmux has-session -t agents 2>/dev/null || start-agents >/dev/null
+if tmux list-windows -t agents -F '#W' | grep -qx -- "$name"; then
+  echo "There is already a window named $name." >&2
+  exit 1
+fi
+
+command=$tool
+for arg in "$@"; do
+  command+=" $(printf '%q' "$arg")"
+done
+mkdir -p "$folder"
+tmux new-window -d -t agents: -n "$name" -c "$folder"
+tmux send-keys -t "agents:$name" "$command" Enter
+echo "Started $tool in window '$name' ($folder). Attach with: tmux attach -t agents"

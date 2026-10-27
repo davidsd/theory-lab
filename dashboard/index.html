@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lab agents</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1f;--muted:#6b6b70;--line:#e3e3e0;--codex:#0b6bcb;--claude:#c2591b;
+--ok:#1f8a4c;--idle:#8a8a8f;--warn:#b7791f;--bad:#d23b3b;--badbg:#fdeeee}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1e1e21;--fg:#ececee;--muted:#9a9aa0;--line:#2e2e33;
+--codex:#5aa7ff;--claude:#ff9a5c;--ok:#4cc483;--idle:#77777d;--warn:#e0a84a;--bad:#ff6b6b;--badbg:#3a1d1f}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:28px 0 10px}
+.sub{color:var(--muted);font-size:13px}
+.grid{display:grid;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.top{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 10px}
+.name{font-weight:600}.name a{color:inherit;text-decoration:none}.name a:hover{text-decoration:underline}
+.pill{font-size:12px;padding:1px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.Codex{color:var(--codex)}.Claude{color:var(--claude)}.q{color:var(--muted)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:1px}
+.run{background:var(--ok)}.idle{background:var(--idle)}.pend{background:var(--warn)}
+.meta{color:var(--muted);font-size:13px}
+.msg{margin-top:6px;white-space:pre-wrap;word-break:break-word;font-size:14px}
+.more{color:var(--codex);cursor:pointer;font-size:13px;margin-left:4px}
+.meters{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.m{margin:10px 0 2px}.m:first-of-type{margin-top:6px}
+.mh{display:flex;justify-content:space-between;gap:8px;font-size:14px}.mh b{font-weight:600}
+.bar{position:relative;height:10px;border-radius:5px;background:var(--line);margin-top:4px;overflow:visible}
+.fill{position:absolute;left:0;top:0;bottom:0;border-radius:5px;background:var(--ok)}
+.fill.warn{background:var(--warn)}.fill.bad{background:#d23b3b}
+.tick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--fg);opacity:.55}
+.tok{font-size:13px;color:var(--muted);margin-top:8px}
+.fit{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line);font-size:14px}
+.fit b{font-size:16px}.fit .bad{color:#d23b3b}
+.tip{position:relative;display:inline-block;width:15px;height:15px;line-height:15px;text-align:center;border-radius:50%;
+border:1px solid var(--muted);color:var(--muted);font-size:10px;font-style:normal;cursor:help;margin-left:3px;vertical-align:1px}
+.tip:hover::after,.tip:focus::after{content:attr(data-tip);position:absolute;z-index:9;left:50%;top:20px;transform:translateX(-50%);
+width:min(300px,80vw);padding:8px 10px;border-radius:8px;background:var(--fg);color:var(--bg);font-size:12px;line-height:1.4;
+text-align:left;white-space:pre-line;font-weight:normal}
+.empty{color:var(--muted);font-style:italic}
+.proj{margin-top:26px}.ph{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin-bottom:8px}
+.ph h2{margin:0;font-size:18px;text-transform:none;letter-spacing:0;color:var(--fg)}.ph h2 a{color:inherit;text-decoration:none}
+.ph h2 a:hover{text-decoration:underline}
+.role{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.sub-agents{display:grid;gap:8px;margin:8px 0 0 18px}
+.sub-agents .card{padding:10px 12px}
+.slots{display:inline-flex;gap:3px;vertical-align:-1px}.slot{width:10px;height:10px;border-radius:3px;border:1px solid var(--idle)}
+.ctl{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted)}
+.ctl a{display:inline-block;min-width:22px;text-align:center;padding:0 6px;border:1px solid var(--line);border-radius:6px;
+color:var(--fg);text-decoration:none;background:var(--card);line-height:20px}.ctl a:hover{border-color:var(--muted)}
+.ctl b{color:var(--fg);font-weight:600}
+.alerts{display:grid;gap:8px;margin-top:14px}.alerts:empty{display:none}
+.alert{border:1px solid var(--bad);background:var(--badbg);color:var(--fg);border-radius:10px;padding:10px 14px}
+.alert b{color:var(--bad)}.alert a{color:inherit}
+.slot.on{background:var(--ok);border-color:var(--ok)}.slot.wait{background:var(--warn);border-color:var(--warn)}
+</style></head><body><main>
+<h1>Lab agents</h1><div class="sub" id="stamp">Loading…</div>
+<div class="alerts" id="alerts"></div>
+<div class="meters" id="usage" style="margin-top:14px"></div>
+<div id="projects"></div>
+<h2>Director</h2><div class="grid" id="director"></div>
+</main><script>
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const url=u=>/^https:\/\//.test(String(u??""))?esc(u):"#";   // links come from job names and files: https only, escaped
+const ago=t=>{if(!t)return"";const s=Math.max(0,Date.now()/1000-t);return s<90?Math.round(s)+"s ago":s<5400?Math.round(s/60)+" min ago":(s/3600).toFixed(1)+" h ago"};
+const pill=(m,label)=>`<span class="pill ${m==="?"?"q":String(m).replace(/[^A-Za-z]/g,"")}" title="${esc(m)}">${esc(label||m)}</span>`;
+const LONG=600, opened=new Set();  // which long messages the viewer expanded, kept across refreshes
+function toggle(a){const key=a.dataset.key;opened.has(key)?opened.delete(key):opened.add(key);tick()}
+const msg=(t,key)=>{if(!t)return"";if(t.length<=LONG)return`<div class="msg">${esc(t)}</div>`;
+  if(opened.has(key))return`<div class="msg">${esc(t)}<a class="more" data-key="${esc(key)}" onclick="toggle(this)">less</a></div>`;
+  const i=t.lastIndexOf(" ",LONG);
+  return`<div class="msg">${esc(t.slice(0,i>LONG/2?i:LONG))}…<a class="more" data-key="${esc(key)}" onclick="toggle(this)">more</a></div>`};
+const latest=(label,t,m,key)=>m?`<div class="meta" style="margin-top:6px">${label} (${ago(t)}):</div>`+msg(m,key):"";
+function jobCard(j){
+  const note=j.state!=="running"?"Waiting for Slurm to start it; its model shows once it runs.":"No message yet.";
+  return `<div class="card"><div class="top"><span class="dot ${j.state==="running"?"run":"pend"}"></span>
+    <span class="role">${esc(j.kind)}</span><span class="name"><a href="${url(j.url)}" target="_blank" rel="noopener">#${esc(j.issue)} ${esc(j.title)}</a></span>
+    ${j.model==="?"&&j.state!=="running"?"":pill(j.model,j.model_label)}</div>
+    <div class="meta">job ${esc(j.job)} · ${esc(j.state)} ${esc(j.elapsed)} of ${esc(j.limit)} · ${j.state==="running"?`${esc(j.cpus)} CPUs${j.cpu_used!=null?` (using ${j.cpu_used.toFixed(1)})`:""} · ${gb(j.rss)} of a ${esc(j.mem)} cap`:`asks ${esc(j.cpus)} CPUs, ${esc(j.mem)} cap`}</div>
+    ${j.message?latest("Latest",j.updated,j.message,"job"+j.job):`<div class="meta" style="margin-top:6px">${note}</div>`}</div>`}
+let ORG="";
+// A button opens a pre-filled request in ORG/lab for the PI to submit; the director applies it.
+function ask(cmd,why){const body=`From the PI: please run \`${cmd}\`.\n\n${why}\n\n(Opened from the dashboard.)`;
+  return `https://github.com/${ORG}/lab/issues/new?labels=request&title=${encodeURIComponent(cmd)}&body=${encodeURIComponent(body)}`}
+const btn=(label,cmd,why,title)=>`<a href="${esc(ask(cmd,why))}" target="_blank" title="${esc(title)}">${label}</a>`;
+function controls(l){
+  const n=l.limit||0;
+  let h=`<span class="ctl">agents ${n>0?btn("−",`lab limit ${l.project} ${n-1}`,`One fewer agent for ${l.project} (now ${n}).`,"Request one fewer"):""}<b>${n}</b>${btn("+",`lab limit ${l.project} ${n+1}`,`One more agent for ${l.project} (now ${n}).`,"Request one more")}</span>`;
+  if(l.account==="hpc"){const b=l.budget||0,step=50000;
+    h+=`<span class="ctl">HPC ${b>0?btn("−",`lab budget ${l.project} ${Math.max(0,b-step)}`,`Lower ${l.project}'s monthly HPC budget from ${b} SUs.`,"Request 50k fewer SUs a month"):""}<b>${b?fmt(b):"none"}</b>/mo${btn("+",`lab budget ${l.project} ${b+step}`,`Raise ${l.project}'s monthly HPC budget from ${b} SUs.`,"Request 50k more SUs a month")}</span>`}
+  return h}
+function projectHTML(l,jobs){
+  const running=jobs.filter(j=>j.state==="running").length,waiting=jobs.length-running,n=Math.max(l.limit||0,jobs.length);
+  const slots=Array.from({length:n},(_,i)=>`<span class="slot ${i<running?"on":i<running+waiting?"wait":""}"></span>`).join("");
+  return `<section class="proj"><div class="ph"><h2><a href="${url(l.url)}" target="_blank" rel="noopener">${esc(l.project)}</a></h2>
+    <span class="meta">${esc(l.status)} · ${esc(l.account)} account</span>${controls(l)}
+    <span class="meta"><span class="slots" title="running / waiting / free">${slots}</span> ${running} of ${l.limit} slots busy${waiting?`, ${waiting} waiting`:""}</span></div>
+    <div class="card"><div class="top"><span class="dot ${l.running?"run":"idle"}"></span><span class="role">lead</span>${pill(l.model,l.model_label)}
+      <span class="meta">${l.running?"in a pass since "+ago(l.since):"idle between passes"}</span></div>
+      ${latest(l.running?"Latest":"Last pass",l.updated,l.message,"lead-"+l.project)}</div>
+    ${jobs.length?`<div class="sub-agents">${jobs.map(jobCard).join("")}</div>`:""}</section>`}
+const gb=b=>b==null?"?":b<1e9?Math.round(b/1e6)+" MB":(b/1e9).toFixed(1)+" GB";
+function machineHTML(m){
+  if(!m)return"";
+  const a=m.alloc??0,t=m.slurm_cpus||m.cpus,busy=m.busy;
+  return `<div class="card"><div class="top"><span class="name">CPUs</span><span class="meta">agentbox, ${m.cpus} in all</span></div>
+    ${meter("Given to jobs",100*a/t,`${a} of ${t}`+(a>=t?" · new jobs wait":""),null,75,100)}
+    ${busy!=null?meter("Actually busy",100*busy/m.cpus,`${busy.toFixed(1)} of ${m.cpus} · load ${m.load[0].toFixed(1)}`,null,75,95):""}</div>
+  <div class="card"><div class="top"><span class="name">Memory</span><span class="meta">not reserved by jobs; caps only</span></div>
+    ${meter("In use",100*m.mem_used/m.mem_total,`${gb(m.mem_used)} of ${gb(m.mem_total)}`,null,70,90)}</div>`}
+let MACHINE=null;
+function render(d){
+  MACHINE=d.machine;
+  const iso=t=>Date.parse(t)/1000;
+  document.getElementById("alerts").innerHTML=(d.alerts||[]).map(a=>`<div class="alert"><b>Lab-wide alert</b> ·
+    <a href="${url(a.url)}" target="_blank" rel="noopener">#${esc(a.number)} ${esc(a.title)}</a>
+    <span class="meta">· opened ${ago(iso(a.created))}${a.comments?` · ${a.comments} update${a.comments>1?"s":""}, last ${ago(iso(a.updated))}`:""}</span></div>`).join("");
+  if(d.org)ORG=d.org;
+  document.getElementById("stamp").textContent="Updated "+new Date(d.time*1000).toLocaleTimeString()+" · refreshes every 15 s"+(d.chats.length?" · interactive chats: "+d.chats.join(", "):"");
+  const known=new Set(d.leads.map(l=>l.project));
+  const order=[...d.leads].sort((a,b)=>(a.status!=="active")-(b.status!=="active")||a.project.localeCompare(b.project));
+  let html=order.map(l=>projectHTML(l,d.jobs.filter(j=>j.project===l.project))).join("");
+  const stray=d.jobs.filter(j=>!known.has(j.project));
+  if(stray.length)html+=`<section class="proj"><div class="ph"><h2>Other jobs</h2></div><div class="sub-agents" style="margin-left:0">${stray.map(jobCard).join("")}</div></section>`;
+  document.getElementById("projects").innerHTML=html||`<div class="card empty">No projects.</div>`;
+  const r=d.director;
+  document.getElementById("director").innerHTML=`<div class="card"><div class="top"><span class="dot ${r.running?"run":"idle"}"></span>
+    <span class="name">Director (hourly passes)</span>${pill(r.model,r.model_label)}<span class="meta">${r.running?"in a pass since "+ago(r.since):"idle"}</span></div>
+    ${latest(r.running?"Latest":"Last pass",r.updated,r.message,"director")}</div>`;
+  EST=d.estimates||{};
+  document.getElementById("usage").innerHTML=usageHTML(d.usage||{});
+}
+const until=t=>{if(!t)return"";const s=t-Date.now()/1000;if(s<=0)return"resetting";
+  return "renews "+new Date(t*1000).toLocaleString(undefined,{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})+(s<5400?" (in "+Math.round(s/60)+" min)":s<172800?" (in "+(s/3600).toFixed(1)+" h)":"")};
+const fmt=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?Math.round(n/1e3)+"k":String(n);
+// meter(label, used %, right-hand note, tick at % (pace or stop line), warn and bad levels)
+function meter(label,used,note,tick,warn,bad,tickTitle){
+  const u=Math.max(0,Math.min(100,+used||0)),cls=u>=bad?"bad":u>=warn?"warn":"";
+  return`<div class="m"><div class="mh"><span>${esc(label)} <b>${(+used||0).toFixed(0)}%</b></span><span class="meta">${esc(note)}</span></div>
+  <div class="bar"><div class="fill ${cls}" style="width:${u}%"></div>${tick!=null?`<div class="tick" title="${esc(tickTitle||"")}" style="left:calc(${Math.min(100,tick)}% - 1px)"></div>`:""}</div></div>`}
+let EST={};
+const when=t=>new Date(t*1000).toLocaleString(undefined,{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+const dur=h=>h<48?Math.round(h)+" hours":(h/24).toFixed(1)+" days";
+const tip=t=>`<i class="tip" tabindex="0" data-tip="${esc(t)}">i</i>`;
+function fitHTML(e,extra){
+  if(!e||!e.name)return"";
+  const n=e.running??0,now=Date.now()/1000,renew=now+(e.hours_left||0)*3600;
+  if(e.note)return`<div class="fit"><span>Workers that fit: <b>?</b> · ${n} running${tip("No estimate yet: "+e.note.replace(/^not enough data yet: /,"")+"."+(extra?"\n"+extra:""))}</span></div>`;
+  const max=Math.max(0,Math.floor(e.sustain)),out=e.hours_at_now!=null&&e.hours_at_now<e.hours_left;
+  const why=`At most ${max} ${e.name} worker${max===1?"":"s"} can run without using up the weekly allowance before it renews (${when(renew)}).
+Each worker uses about ${e.rate.toFixed(2)}% of the week per hour; ${(e.stop-e.used).toFixed(0)}% is left before the lab's limit of ${e.stop}%.
+Based on ${e.basis}. Your own use of the plan counts too.`+(extra?"\n"+extra:"");
+  return`<div class="fit"><span>Workers that fit: <b class="${max<n?"bad":""}">${max}</b> · ${n} running${tip(why)}</span>
+    <span>${out?`Runs out <b class="bad">${when(now+e.hours_at_now*3600)}</b>${tip(`At the current pace (${n} workers), the allowance runs out ${dur(e.hours_at_now)} from now, ${dur(e.hours_left-e.hours_at_now)} before it renews.`)}`:`Lasts until it renews${tip("At the current pace the allowance lasts until "+when(renew)+".")}`}</span></div>`}
+function usageHTML(u){
+  const c=u.codex||{},cl=u.claude||{},p=cl.plan||{},e=u.hpc||{};let out="";
+  let cx="";(c.windows||[]).forEach(w=>{const d=w.window_minutes>=10080?"Week":w.window_minutes>=300?Math.round(w.window_minutes/60)+"-hour window":w.window_minutes+"-min window";
+    cx+=meter(d,w.used_percent,(w.elapsed_percent!=null?w.elapsed_percent+"% of the time elapsed · ":"")+until(w.resets_at),w.elapsed_percent,
+      Math.min(100,(w.elapsed_percent||0)+15),95,"time elapsed: staying left of this mark keeps pace")});
+  const t=Object.entries(c.tokens_24h||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${esc(k)} ${fmt(v)}`).join(" · ");
+  out+=`<div class="card"><div class="top"><span class="name">Codex</span>${pill("Codex")}${c.credits!=null?`<span class="meta">${Math.round(+c.credits).toLocaleString()} credits</span>`:""}</div>${cx||'<div class="meta">No plan data.</div>'}
+    ${t?`<div class="tok">Tokens, last 24 h: ${t}</div>`:""}${fitHTML(EST.codex,"")}</div>`;
+  const stop=cl.stop_percent??60,runs=cl.lab_runs_7d??0,cap=cl.lab_runs_cap??30;
+  out+=`<div class="card"><div class="top"><span class="name">Claude</span>${pill("Claude")}<span class="meta">shared with your own use</span></div>
+    ${p.five_hour?meter("5-hour window",p.five_hour.used_percentage,until(p.five_hour.resets_at),null,70,90):""}
+    ${p.seven_day?meter("Week",p.seven_day.used_percentage,"lab stops at "+stop+"% · "+until(p.seven_day.resets_at),stop,stop*0.6,stop,"the lab stops using Claude here"):""}
+    ${meter("Lab runs this week",cap?100*runs/cap:0,runs+" of "+cap,null,66,90)}${fitHTML(EST.claude,`The lab's weekly cap leaves ${Math.max(0,cap-runs)} Claude runs.`)}</div>`;
+  let ex=meter("Lab this month",e.lab_budget?100*e.lab_sus/e.lab_budget:0,fmt(e.lab_sus||0)+" of "+fmt(e.lab_budget||0)+" SUs",null,75,90);
+  Object.entries(e.by_project||{}).forEach(([k,v])=>{ex+=meter(k,v.budget?100*v.sus/v.budget:0,fmt(v.sus)+" of "+fmt(v.budget)+" SUs",null,75,90)});
+  out+=`<div class="card"><div class="top"><span class="name">HPC</span><span class="meta">${e.connected?"connected":"not connected"}${e.held_jobs?" · "+e.held_jobs+" held for you":""}</span></div>${ex}</div>`;
+  out+=machineHTML(MACHINE);
+  if(u.mtime)out+=`<div class="meta" style="grid-column:1/-1">Usage as of ${ago(u.mtime)}.</div>`;
+  return out}
+async function tick(){try{render(await (await fetch("api/status")).json())}catch(e){document.getElementById("stamp").textContent="Can't reach the server: "+e}}
+tick();setInterval(tick,15000);
+</script></body></html>

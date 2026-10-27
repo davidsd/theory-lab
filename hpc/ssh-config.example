@@ -1,0 +1,18 @@
+# --- cluster (added by user-setup.sh --hpc) ---
+# Agents reach the cluster only through one shared connection that the PI opens with `hpc-connect`
+# (password/key + TOTP). When that connection is up, ssh uses it and ignores ProxyCommand; when it's down
+# or its socket is stale, the ProxyCommand refuses at once instead of trying to log in. Many centers
+# block hosts that open too many connections a minute, and agents retrying in a loop would trigger that.
+# Replace CLUSTER_LOGIN_HOST and CLUSTER_USER (user-setup.sh does it from lab.conf).
+Host cluster
+    ProxyCommand sh -c "echo 'The cluster is not connected. Ask the PI to run hpc-connect.' >&2; exit 1"
+
+Host cluster cluster-login
+    HostName CLUSTER_LOGIN_HOST
+    User CLUSTER_USER
+    IdentityFile ~/.ssh/cluster_ed25519
+    IdentitiesOnly yes
+    ControlPath ~/.ssh/cm-cluster.sock
+    BatchMode yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 5

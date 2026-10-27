@@ -1,0 +1,7 @@
+# Codex settings for agents on agentbox.
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+# Let commands reach the network: package installs, and ssh to the cluster on the hpc account.
+network_access = true

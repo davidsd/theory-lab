@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# watchdog: mechanical checks every 5 minutes; no model involved. Runs as hpc in the "watchdog" window
+# (`lab up` starts it). It
+#   - pushes every new inbox issue labeled `interrupt` to the PI's phone;
+#   - acts on the PI's answers to held HPC jobs and to new projects' charters (approve or cancel);
+#   - measures the lab's resources every 30 minutes (lab-usage);
+#   - pushes a notification when a Claude session has waited at a permission prompt for 10 minutes,
+#     a lead or director pass has run for 2 hours, a worker's log hasn't changed for an hour,
+#     Codex reaches its limit, the lab passes 90% of its monthly HPC budget, the HPC
+#     connection is down, Slurm's node isn't healthy, or the disk is over 85% full.
+# A problem that persists is pushed again every 6 hours, not every 5 minutes.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+sent=$LAB/state/watchdog-sent   # "key epoch" for each problem already pushed
+
+alert() {  # alert <key> <title> <message> [url]
+  local key=$1 last
+  last=$(awk -v k="$key" '$1 == k {print $2}' "$sent" 2>/dev/null | tail -1)
+  if [[ -z $last ]] || (( $(date +%s) - last >= 6 * 3600 )); then
+    notify "$2" "$3" "${4:-}"
+    echo "$key $(date +%s)" >> "$sent"
+  fi
+}
+
+alert_once() {  # alert_once <key> <title> <message>: push only the first time this key comes up
+  grep -q "^$1 " "$sent" 2> /dev/null && return 0
+  notify "$2" "$3"
+  echo "$1 $(date +%s)" >> "$sent"
+}
+
+resolved() {  # resolved <key>: forget a problem that went away, so a recurrence is pushed at once
+  [[ -f $sent ]] || return 0
+  awk -v k="$1" '$1 != k' "$sent" > "$sent.tmp" && mv "$sent.tmp" "$sent"
+}
+
+age() { echo $(( $(date +%s) - $(stat -c %Y "$1") )); }
+
+open_issues() {  # open_issues <label>: "owner/repo<TAB>number<TAB>title<TAB>url<TAB>labels" per open issue
+  timeout 60 gh search issues --owner "$ORG" --label "$1" --state open --limit 100 \
+    --json number,repository,title,url,labels < /dev/null |
+    jq -r '.[] | [.repository.nameWithOwner, .number, .title, .url, ([.labels[].name] | join(","))] | @tsv'
+}
+
+check_interrupts() {
+  local repo number title url labels
+  while IFS=$'\t' read -r repo number title url labels; do
+    [[ ,$labels, == *,notified,* ]] && continue
+    # GitHub's search can lag behind the label, so also remember pushes here.
+    grep -q "^interrupt-$repo#$number " "$sent" 2> /dev/null && continue
+    notify "${repo#*/}: $title" "Needs your attention" "$url"
+    echo "interrupt-$repo#$number $(date +%s)" >> "$sent"
+    timeout 60 gh issue edit "$number" -R "$repo" --add-label notified > /dev/null < /dev/null
+  done < <(open_issues interrupt)
+}
+
+answer() {  # answer <owner/repo> <issue> <comment>: comment on the issue and close it
+  timeout 60 gh issue comment "$2" -R "$1" --body "$3" > /dev/null < /dev/null &&
+    timeout 60 gh issue close "$2" -R "$1" > /dev/null < /dev/null
+}
+
+# The PI's answers to held HPC jobs. An approval counts only for a job that hpc-submit recorded
+# as held together with this very issue, so no other issue (and none of the PI's own jobs) can be
+# released this way. Nothing happens while HPC is unreachable; the answer waits.
+check_hpc_approvals() {
+  local repo number title url labels job decision state
+  hpc-check > /dev/null || return 0
+  while IFS=$'\t' read -r repo number title url labels; do
+    job=$(awk -F'\t' -v u="$url" '$13 == u && $11 == "held" {print $5}' "$LAB/state/hpc-ledger.tsv" 2> /dev/null | tail -1)
+    [[ $job =~ ^[0-9]+$ ]] || continue   # job ids go into ssh commands: plain numbers only
+    decision=$(pi_decision "$repo" "$number")
+    if [[ $decision == approve ]]; then
+      if timeout 120 ssh -n cluster "scontrol release $job"; then
+        ledger_status "$job" approved
+        answer "$repo" "$number" "Released HPC job $job."
+      else
+        state=$(timeout 120 ssh -n cluster "squeue -h -j $job -o %T" 2> /dev/null)
+        if [[ -z $state ]]; then
+          ledger_status "$job" gone
+          answer "$repo" "$number" "HPC job $job no longer exists, so there was nothing to release."
+        fi   # otherwise try again next round
+      fi
+    elif [[ $decision == cancel ]]; then
+      timeout 120 ssh -n cluster "scancel $job" || true
+      ledger_status "$job" cancelled
+      answer "$repo" "$number" "Cancelled HPC job $job."
+    fi
+  done < <(open_issues hpc-approval)
+}
+
+ledger_status() {  # ledger_status <job> <status>: update the job's line in the HPC ledger
+  local ledger=$LAB/state/hpc-ledger.tsv
+  [[ -f $ledger ]] || return 0
+  (
+    flock 9
+    awk -F'\t' -v OFS='\t' -v j="$1" -v s="$2" '$5 == j && $11 == "held" {$11 = s} {print}' "$ledger" > "$ledger.tmp" &&
+      chmod 644 "$ledger.tmp" && mv "$ledger.tmp" "$ledger"   # only hpc writes the ledger
+  ) 9>"$LAB/state/ledger.lock"
+}
+
+# The PI's answers to new projects' charters; they count only while the project is still proposed.
+check_charters() {
+  local repo number title url labels decision project
+  while IFS=$'\t' read -r repo number title url labels; do
+    project=${repo#*/}
+    [[ $(project_field "$project" status) == proposed ]] || continue
+    decision=$(pi_decision "$repo" "$number")
+    if [[ $decision == approve ]]; then
+      lab start "$project" < /dev/null && answer "$repo" "$number" "Started. The lead's first pass comes within minutes."
+    elif [[ $decision == cancel ]]; then
+      answer "$repo" "$number" "Dropped; the repo will be archived."   # before archiving, which blocks comments
+      lab retire "$project" --no-summary < /dev/null
+    fi
+  done < <(open_issues charter-approval)
+}
+
+check_permission_waits() {
+  local file state since window user
+  for file in "$AGENT_STATUS"/claude-*.json; do
+    [[ -e $file ]] || continue
+    (( $(age "$file") < 12 * 3600 )) || continue   # left behind by a session that ended without saying so
+    read -r state since user window < <(jq -r '[.state, .time, .user, (.tmux_window // "-")] | @tsv' "$file")
+    if [[ $state == needs-permission ]] && (( $(date +%s) - $(date -d "$since" +%s) >= 600 )); then
+      alert "permission-$(basename "$file" .json)" "Claude is waiting for permission" \
+        "Account $user, window $window, since $since"
+    fi
+  done
+}
+
+check_passes() {
+  local file
+  for file in "$LAB"/state/pass-*.running; do
+    [[ -e $file ]] || continue
+    if (( $(age "$file") >= 2 * 3600 )); then
+      alert "$(basename "$file")" "A pass is taking long" "$(basename "$file" .running) has run for over 2 hours."
+    fi
+  done
+}
+
+check_workers() {
+  local id name state elapsed project role issue log
+  while read -r id name state elapsed; do
+    [[ $state == RUNNING ]] || continue
+    IFS=: read -r _ project role issue <<<"$name"
+    log=$PROJECTS/$project/logs/$id-$role-$issue.jsonl
+    if [[ -s $log ]] && (( $(age "$log") >= 3600 )); then
+      alert "stale-$id" "A worker seems stuck" "$project: $role on issue #$issue (job $id) has written nothing for an hour."
+    fi
+  done < <(lab_jobs)
+}
+
+check_resources() {
+  if [[ $(codex_pressure) == stop ]]; then
+    alert codex-limit "Codex is at its limit" "The lab pauses until the window resets; see lab usage."
+  else
+    resolved codex-limit
+  fi
+  local month budget
+  month=$(jq -r '.hpc.lab_sus // 0' "$USAGE/summary.json" 2> /dev/null || echo 0)
+  if (( month * 10 >= HPC_LAB_SUS_PER_MONTH * 9 )); then
+    alert_once "hpc-budget-$(date +%Y-%m)" "HPC: 90% of the monthly budget used" "$month of $HPC_LAB_SUS_PER_MONTH SUs; bigger jobs now wait for you."
+  fi
+}
+
+check_machine() {
+  if [[ ${WATCH_HPC:-no} == yes ]]; then
+    if hpc-check > /dev/null; then
+      resolved hpc-down
+    else
+      alert hpc-down "HPC is not connected" "Run hpc-connect on agentbox as hpc (password + TOTP)."
+    fi
+  fi
+  if sinfo -h -N -o '%T' | grep -qiE 'down|drain|fail'; then
+    alert slurm-node "Slurm's node is not healthy" "Check with: sinfo -N -l"
+  else
+    resolved slurm-node
+  fi
+  local used
+  used=$(df -P / | awk 'NR == 2 {print $5 + 0}')
+  if (( used >= 85 )); then alert disk "The disk is ${used}% full" "Clean up, or grow the disk (README)."; else resolved disk; fi
+}
+
+echo "$(now) watchdog started"
+round=0
+while :; do
+  load_conf   # settings changes apply without a restart
+  (( round % 6 == 0 )) && lab-usage
+  round=$(( round + 1 ))
+  check_interrupts
+  check_hpc_approvals
+  check_charters
+  check_permission_waits
+  check_passes
+  check_workers
+  check_resources
+  check_machine
+  sleep 300
+done

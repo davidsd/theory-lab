@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# lab-worker: the body of a worker's Slurm job (`lab spawn` submits it). Claims the issue for the lab,
+# gives the agent its own clone of the project (jobs/<job>, where it commits and pushes like any
+# collaborator), runs one agent session there inside the job's CPUs and memory, then comments on the
+# issue saying how the job ended, so the lead learns about crashes, time limits and cancellations too.
+# Slurm signals USR1 five minutes before the time limit (`lab spawn` asks for that) and TERM on
+# cancellation; either stops the agent cleanly.
+#
+# Codex agents run interactively (LAB_INTERACTIVE=no for the old non-interactive way): the session
+# lives in its own tmux server inside the job (socket lab-<job>), so the PI can attach and type to the
+# agent while it works (`talk <project> <issue>`, or the window w-<project>-<issue> in
+# the owner's tmux session). The agent touches a done file when it has finished (the job then waits
+# for 2 quiet minutes, in case the PI is talking to it); the job also ends when the agent's last turn
+# ended 20 minutes ago. The agent's messages are copied
+# into the job's log as they come, in the format of `codex exec --json`, so the dashboard and
+# record_run read it as before.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+project=$LAB_PROJECT role=$LAB_ROLE issue=$LAB_ISSUE model=${LAB_MODEL:-codex}
+folder=$PROJECTS/$project
+job=${SLURM_JOB_ID:-local}
+log=$folder/logs/$job-$role-$issue.jsonl
+last=$folder/logs/$job-$role-$issue-last.md
+mkdir -p "$folder/logs"
+
+say() { timeout 60 gh issue comment "$issue" -R "$ORG/$project" --body "$1" > /dev/null < /dev/null || true; }
+
+# Claim the issue, so collaborators (and other lab agents) see it's taken.
+timeout 60 gh issue edit "$issue" -R "$ORG/$project" --add-assignee @me > /dev/null < /dev/null || true
+say "lab (agent): working on this as $role job $job ($model) on agentbox."
+
+# The agent's own clone, with the project's outside-git folders linked in.
+work=$folder/jobs/$job
+mkdir -p "$folder/jobs"
+rm -rf "$work"
+if ! { git clone -q "$folder" "$work" &&
+       git -C "$work" remote set-url origin "$(git -C "$folder" remote get-url origin)" &&
+       git -C "$work" pull -q --rebase < /dev/null; }; then
+  say "lab (agent): $role job $job couldn't make its clone of the project, so it did nothing."
+  exit 1
+fi
+for shared in data code logs worktrees; do
+  mkdir -p "$folder/$shared"
+  ln -s "$folder/$shared" "$work/$shared"
+done
+
+prompt=$(render_role "$role" PROJECT="$project" ORG="$ORG" PI="$PI_GITHUB" ISSUE="$issue" JOB="$job" \
+  CPUS="${SLURM_CPUS_PER_TASK:-?}" MEM="$(( ${SLURM_MEM_PER_NODE:-0} / 1024 )) GB" DATE="$(date +%F)")
+
+stopped=""
+stop_agent() {
+  stopped=$1
+  pkill -TERM -P "$agent" 2> /dev/null
+  kill -TERM "$agent" 2> /dev/null
+}
+trap 'stop_agent "it reached its time limit"' USR1
+trap 'stop_agent "it was cancelled"' TERM
+
+interactive=${LAB_INTERACTIVE:-yes}
+[[ $model == codex ]] || interactive=no   # Claude workers stay non-interactive for now
+
+if [[ $interactive == yes ]]; then
+  sock=lab-$job
+  done_file=$folder/logs/$job-$role-$issue.done
+  config=${CODEX_HOME:-$HOME/.codex}/config.toml
+  rm -f "$done_file"
+  # Trust the clone, so Codex doesn't stop at its "Trust this folder?" question.
+  (flock 9; printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$work" >> "$config") 9>"$config.lock"
+  prompt+=$'\n\n## This session is interactive\n\n'"The PI may attach to this session and type to you while you work. Answer them directly and briefly, then carry on with your task, taking what they said into account. When you have completely finished (work pushed, final comment on the issue), run \`touch $done_file\` and stop."
+  stop_agent() {
+    stopped=$1
+    tmux -L "$sock" kill-server 2> /dev/null
+  }
+  trap 'stop_agent "it reached its time limit"' USR1
+  trap 'stop_agent "it was cancelled"' TERM
+  start=$(date +%s)
+  runner=$folder/logs/$job-$role-$issue.run.sh   # bash, whatever tmux's default shell is
+  mapfile -t flags < <(agent_flags codex "$role")
+  { printf '#!/usr/bin/env bash\nexec codex --cd %q -s danger-full-access -a never' "$work"
+    printf ' %q' "${flags[@]}" "$prompt"; printf '\n'; } > "$runner"
+  TMUX= tmux -L "$sock" -f /dev/null new-session -d -s w -x 200 -y 50 "bash $(printf '%q' "$runner")"
+  TMUX= tmux -L "$sock" set -g status-left "[$project #$issue · job $job] " \; set -g status-right "detach: prefix d" > /dev/null
+  # A window in the owner's tmux session that shows it (closes by itself when the job ends).
+  if tmux has-session -t agents 2> /dev/null; then
+    tmux new-window -d -t agents: -n "w-$project-$issue" "TMUX= tmux -L $sock attach -t w" 2> /dev/null || true
+  fi
+  # Find the session's record, and note its id first in the log, as `codex exec --json` does.
+  rollout=""
+  for _ in $(seq 60); do
+    rollout=$(grep -l -F "\"cwd\":\"$work\"" $(find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -newermt "@$start" 2> /dev/null) /dev/null 2> /dev/null | head -1)
+    [[ -n $rollout ]] && break
+    sleep 2
+  done
+  : > "$log"
+  if [[ -n $rollout ]]; then
+    thread=$(head -1 "$rollout" | jq -r '.payload.id // .payload.session_id // empty')
+    printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread" >> "$log"
+  fi
+  copied=0
+  copy_messages() {  # the agent's new messages, from its record into the log
+    [[ -n $rollout ]] || return 0
+    local n
+    n=$(wc -l < "$rollout")
+    (( n > copied )) || return 0
+    tail -n +"$((copied + 1))" "$rollout" | head -n "$((n - copied))" |
+      jq -c 'select(.type == "response_item" and .payload.type == "message" and .payload.role == "assistant")
+             | {type: "item.completed", item: {type: "agent_message",
+                text: ([.payload.content[]? | select(.type == "output_text") | .text] | join("\n"))}}
+             | select(.item.text != "")' >> "$log" 2> /dev/null
+    copied=$n
+  }
+  while TMUX= tmux -L "$sock" has-session 2> /dev/null; do
+    copy_messages
+    if [[ -f $done_file ]]; then
+      # Finished. If the PI is still talking to it (activity in the last 2 minutes), wait for a quiet
+      # 2 minutes, up to 30 minutes in all, before closing.
+      for _ in $(seq 180); do
+        [[ -z $rollout ]] || (( $(date +%s) - $(stat -c %Y "$rollout") > 120 )) && break
+        copy_messages
+        sleep 10 & wait $!
+      done
+      break
+    fi
+    # Idle: its last turn ended 20 minutes ago (it is waiting for input, not running a long command).
+    if [[ -n $rollout ]] && (( $(date +%s) - $(stat -c %Y "$rollout") > 1200 )) &&
+       [[ $(jq -r 'select(.type == "event_msg" and (.payload.type == "task_started" or .payload.type == "task_complete")) | .payload.type' "$rollout" 2> /dev/null | tail -1) == task_complete ]]; then
+      stopped=${stopped:-"its session was idle for 20 minutes"}
+      break
+    fi
+    sleep 10 & wait $!
+  done
+  copy_messages
+  TMUX= tmux -L "$sock" kill-server 2> /dev/null
+  jq -rs '[.[] | select(.type == "item.completed") | .item.text] | last // empty' "$log" > "$last" 2> /dev/null
+  rm -f "$runner"
+  [[ -f $done_file ]] && code=0 || code=${code:-1}
+  rm -f "$done_file"
+  (flock 9; python3 - "$config" "$work" <<'EOF'
+import sys
+path, work = sys.argv[1], sys.argv[2]
+s = open(path).read()
+s = s.replace(f'\n[projects."{work}"]\ntrust_level = "trusted"\n', '\n', 1)
+open(path, "w").write(s)
+EOF
+  ) 9>"$config.lock"
+else
+  run_agent "$model" "$work" "$prompt" "$log" "$last" &
+  agent=$!
+  wait "$agent"
+  code=$?
+  if [[ -n $stopped ]]; then   # the signal interrupted wait; let the agent finish exiting
+    wait "$agent" 2> /dev/null
+    code=$?
+  fi
+fi
+
+record_run "$model" "$log" "$project" "$role" "$issue"
+
+# Remove the clone if everything in it was pushed; otherwise keep it and say so.
+leftover=""
+if [[ -z $(git -C "$work" status --porcelain 2> /dev/null) && -z $(git -C "$work" log --oneline '@{u}..' 2> /dev/null) ]]; then
+  rm -rf "$work"
+else
+  leftover=" It left uncommitted or unpushed work in \`jobs/$job\` on agentbox."
+fi
+
+summary=$(head -c 1500 "$last" 2> /dev/null)
+session=""
+[[ $model == codex ]] && session=$(codex_thread "$log")
+body="lab (agent): $role job $job ($model) ended${stopped:+ because $stopped}, exit code $code.$leftover"
+[[ -n $session ]] && body+=" Codex session: \`$session\` (continue it with \`codex resume $session\` on the $(id -un) account)."
+[[ ${interactive:-no} == yes && -z $stopped && $code != 0 ]] && body+=" (It ended without marking itself done.)"
+body+=$'\n\n'"Its last message:"$'\n\n'"${summary:-(none)}"
+say "$body"
+exit $code

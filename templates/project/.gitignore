@@ -1,0 +1,28 @@
+# On agentbox, outside git: big outputs, logs, code clones, worktrees, workers' clones
+/data
+/logs
+/code
+/worktrees
+/jobs
+
+# personal scratch space, never committed
+people/*/scratch/
+
+# per-user Claude Code settings
+.claude/settings.local.json
+
+# LaTeX build products (commit the .tex and the final .pdf)
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.blg
+notes/tex/*.log
+
+# OS, editors, Python
+.DS_Store
+*~
+*.swp
+__pycache__/

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Claude Code hook (set up in ~/.claude/settings.json): records this session's state in
+# /srv/agents/status/claude-<account>-<session>.json, where the supervisor reads it.
+# Usage: agent-status-hook <state>, with the hook's JSON on stdin.
+
+state=$1
+input=$(cat)
+user=$(id -un)
+session=$(jq -r '.session_id // "unknown"' <<<"$input")
+file=/srv/agents/status/claude-$user-$session.json
+
+if [[ $state == ended ]]; then
+  rm -f "$file"
+  exit 0
+fi
+
+window=""
+if [[ -n ${TMUX_PANE:-} ]]; then
+  window=$(tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null || true)
+fi
+
+# Only the Stop hook carries Claude's reply; keep the previous one through later states.
+previous_reply=""
+[[ -f $file ]] && previous_reply=$(jq -r '.last_reply // ""' "$file" 2>/dev/null)
+
+jq --arg state "$state" --arg time "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg user "$user" --arg window "$window" \
+  --arg previous_reply "$previous_reply" \
+  '{state: $state, time: $time, user: $user, tmux_window: $window, cwd: .cwd,
+    session_id: .session_id, message: .message,
+    last_reply: ((.last_assistant_message // "") | .[0:600] | if . == "" then $previous_reply else . end)}' \
+  <<<"$input" > "$file.tmp" && mv "$file.tmp" "$file"
+exit 0

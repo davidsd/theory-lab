@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# lab-rm: how agents delete files they no longer need, on agentbox or on the cluster.
+#   lab-rm --project <p> --issue <n> --reason "<why>" <path>... (HPC paths as hpc:/abs/path)
+# Deletes (recursively) only inside the project's own areas:
+#   agentbox: /srv/projects/<p>/{data,logs,worktrees,jobs}/...
+#   HPC:  $HPC_SCRATCH_ROOT/lab/<p>/... and $HPC_HOME_ROOT/lab/<p>/... (lab.conf)
+# never the area itself, and never through a symlink into somewhere else. Logs to /srv/lab/state/deletions.tsv.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+usage() {
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+project="" issue="" reason=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project) project=$2; shift 2 ;;
+    --issue) issue=$2; shift 2 ;;
+    --reason) reason=$2; shift 2 ;;
+    --*) usage ;;
+    *) break ;;
+  esac
+done
+[[ -n $project && -n $issue && -n $reason && $# -gt 0 ]] || usage
+[[ $project =~ ^[A-Za-z0-9._-]+$ && -d $PROJECTS/$project ]] || die "Unknown project '$project'."
+
+local_roots=("$PROJECTS/$project/data/" "$PROJECTS/$project/logs/" "$PROJECTS/$project/worktrees/" "$PROJECTS/$project/jobs/")
+remote_roots=("${HPC_SCRATCH_ROOT:?set HPC_SCRATCH_ROOT in lab.conf}/lab/$project/")
+[[ -n ${HPC_HOME_ROOT:-} ]] && remote_roots+=("$HPC_HOME_ROOT/lab/$project/")
+log=$LAB/state/deletions.tsv
+
+inside() {  # inside <path> <root>...: path is strictly below one of the roots
+  local p=$1 r; shift
+  for r in "$@"; do [[ $p == "$r"?* ]] && return 0; done
+  return 1
+}
+
+local_paths=() remote_paths=()
+for a in "$@"; do
+  if [[ $a == hpc:* ]]; then
+    p=${a#hpc:}
+    [[ $p == /* && $p =~ ^[A-Za-z0-9._/+=@,-]+$ && $p != *'/../'* && $p != *'/..' && $p != *'/./'* && $p != *'/.' ]] \
+      || die "Bad HPC path '$p': absolute, plain characters, no '.' or '..' parts."
+    remote_paths+=("${p%/}")
+  else
+    [[ -e $a || -L $a ]] || { echo "No such file: $a" >&2; continue; }
+    base=$(basename -- "$a")
+    [[ $base != . && $base != .. ]] || die "Refusing $a: name a file or folder, not '.' or '..'."
+    parent=$(realpath -e -- "$(dirname -- "$a")") || die "Can't resolve $a."
+    p=$parent/$base
+    inside "$p" "${local_roots[@]}" || die "Refusing $a ($p): outside $project's data, logs, worktrees and jobs."
+    local_paths+=("$p")
+  fi
+done
+
+if (( ${#remote_paths[@]} )); then
+  # Resolve each path's parent on the cluster (one connection), so a symlinked folder can't lead outside.
+  parents=()
+  for p in "${remote_paths[@]}"; do parents+=("$(dirname "$p")"); done
+  # every path is quoted for the remote shell (printf %q), so no name or symlink target can inject a command
+  resolved=$(timeout 120 ssh -n cluster "realpath -m -- $(printf '%q ' "${parents[@]}")") || die "Couldn't resolve the HPC paths: $resolved"
+  mapfile -t rparents <<<"$resolved"
+  (( ${#rparents[@]} == ${#remote_paths[@]} )) || die "Couldn't resolve the HPC paths."
+  checked=()
+  for i in "${!remote_paths[@]}"; do
+    p=${rparents[$i]}/$(basename "${remote_paths[$i]}")
+    inside "$p" "${remote_roots[@]}" || die "Refusing hpc:${remote_paths[$i]} ($p): outside $project's lab folders on the cluster."
+    checked+=("$p")
+  done
+  out=$(timeout 3600 ssh -n cluster "rm -rf --one-file-system -- $(printf '%q ' "${checked[@]}")" 2>&1) || die "rm on the cluster failed: $out"
+  for p in "${checked[@]}"; do
+    echo "Deleted hpc:$p"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "hpc:$p" "${reason//[$'\t\n']/ }" >> "$log"
+  done
+fi
+
+for p in "${local_paths[@]}"; do
+  rm -rf --one-file-system -- "$p" || die "rm failed on $p"
+  echo "Deleted $p"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "$p" "${reason//[$'\t\n']/ }" >> "$log"
+done

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# lab-cancel: how agents cancel Slurm jobs on agentbox. For HPC, use hpc-cancel.
+#   lab-cancel --project <p> --issue <n> --reason "<why>" [--agent] <job>...
+# Cancels a job only if it belongs to <p>: named lab:<p>:... or run from a folder under /srv/projects/<p>/.
+# A job that is itself an agent (lab:<p>:<role>:<issue>) needs --agent, so stopping an agent is deliberate:
+# only a lead stopping one of its project's agents uses it. Logs every cancel to /srv/lab/state/cancels.tsv.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+usage() {
+  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+project="" issue="" reason="" agent=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project) project=$2; shift 2 ;;
+    --issue) issue=$2; shift 2 ;;
+    --reason) reason=$2; shift 2 ;;
+    --agent) agent=1; shift ;;
+    --*) usage ;;
+    *) break ;;
+  esac
+done
+[[ -n $project && -n $issue && -n $reason && $# -gt 0 ]] || usage
+[[ $project =~ ^[A-Za-z0-9._-]+$ && -d $PROJECTS/$project ]] || die "Unknown project '$project'."
+
+log=$LAB/state/cancels.tsv
+failed=0
+for job in "$@"; do
+  [[ $job =~ ^[0-9]+(_[0-9]+)?$ ]] || { echo "Skipping '$job': not a job id." >&2; failed=1; continue; }
+  line=$(squeue -h -j "$job" -o '%j|%Z' 2>/dev/null | head -1)
+  [[ -n $line ]] || { echo "Job $job is not in the queue." >&2; failed=1; continue; }
+  name=${line%%|*} workdir=${line#*|}
+  if [[ $name != "lab:$project:"* && $workdir/ != "$PROJECTS/$project/"* ]]; then
+    echo "Refusing job $job ($name, $workdir): not a $project job." >&2; failed=1; continue
+  fi
+  if [[ $name =~ ^lab:[^:]+:(worker|explorer|verifier|lead):[0-9]+$ ]] && (( ! agent )); then
+    echo "Refusing job $job ($name): it is an agent. Only a lead stops one, with --agent." >&2; failed=1; continue
+  fi
+  if out=$(scancel "$job" 2>&1); then
+    echo "Cancelled agentbox job $job ($name)."
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "agentbox:$job $name" "${reason//[$'\t\n']/ }" >> "$log"
+  else
+    echo "scancel $job failed: $out" >&2; failed=1
+  fi
+done
+exit $failed

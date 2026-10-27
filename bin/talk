@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# talk <project> <issue> [--copy]: talk with a worker, explorer or verifier.
+#
+# If the agent is running interactively (Codex workers do), this attaches you to its live session:
+# type to it directly; it answers and carries on. Detach with your tmux prefix, then d (inside your
+# own tmux, press the prefix twice). Otherwise, or with --copy, it opens a read-only copy (a fork) of
+# the agent's conversation, which knows everything the agent has read and done; the agent itself
+# isn't disturbed. Agents on the agent account need your own login (this uses sudo for them).
+set -euo pipefail
+LAB=${LAB_DIR:-/srv/lab}
+PROJECTS=${PROJECTS_DIR:-/srv/projects}
+[[ $# -ge 2 ]] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+project=$1 issue=$2 copy=${3:-}
+owner=$(jq -r --arg p "$project" '.projects[$p].account // empty' "$LAB/registry.json")
+[[ -n $owner ]] || { echo "No project named $project." >&2; exit 1; }
+
+# The newest job on that issue: its log is logs/<job>-<role>-<issue>.jsonl.
+log=$(ls -t "$PROJECTS/$project"/logs/*-*-"$issue".jsonl 2>/dev/null | head -1 || true)
+[[ -n $log ]] || { echo "No agent has worked on $project #$issue yet." >&2; exit 1; }
+job=$(basename "$log" | cut -d- -f1)
+[[ $job =~ ^[0-9]+$ ]] || { echo "Unexpected log name: $log" >&2; exit 1; }   # job ids reach shell commands below
+dir=$PROJECTS/$project/jobs/$job
+[[ -d $dir ]] || dir=$PROJECTS/$project
+state=$(squeue -h -j "$job" -o %T 2>/dev/null || true)
+echo "$project #$issue: job $job (${state:-finished}), clone $dir"
+
+as_owner() {
+  if [[ $(id -un) == "$owner" ]]; then "$@"; else sudo -iu "$owner" "$@"; fi
+}
+
+if [[ $copy != --copy && $state == RUNNING ]] && as_owner env TMUX= tmux -L "lab-$job" has-session 2>/dev/null; then
+  echo "Attaching to the live session. Detach: prefix d (inside your own tmux: prefix, prefix, d)."
+  exec_cmd=(env TMUX= tmux -L "lab-$job" attach -t w)
+  if [[ $(id -un) == "$owner" ]]; then exec "${exec_cmd[@]}"; else exec sudo -iu "$owner" "${exec_cmd[@]}"; fi
+fi
+
+thread=$(jq -r 'select(.type == "thread.started") | .thread_id' "$log" 2>/dev/null | head -1)
+if [[ -n $thread ]]; then
+  echo "Codex session $thread: opening a read-only copy. Quit with Ctrl-C twice or /quit."
+  as_owner codex fork "$thread" -C "$dir" -s read-only \
+    "This is the PI, talking with a copy of you while the original keeps working; nothing you do here reaches it. Don't change files. Answer my questions about your task as yourself."
+else
+  # A Claude worker: its session is the newest transcript for the clone's folder.
+  slug=$(sed 's|[^A-Za-z0-9]|-|g' <<<"$dir")
+  session=$(as_owner bash -c "ls -t ~/.claude/projects/$slug/*.jsonl 2>/dev/null | head -1" || true)
+  [[ -n $session ]] || { echo "Can't find this agent's session." >&2; exit 1; }
+  session=$(basename "$session" .jsonl)
+  echo "Claude session $session: opening a read-only copy. Quit with /exit."
+  [[ $session =~ ^[A-Za-z0-9-]+$ ]] || { echo "Unexpected session name: $session" >&2; exit 1; }
+  as_owner bash -c "cd $(printf %q "$dir") && claude --resume $session --fork-session --permission-mode plan"
+fi

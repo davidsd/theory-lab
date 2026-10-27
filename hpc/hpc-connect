@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Open the shared HPC connection that agents on this account use.
+# The first time, you type your cluster password and a one-time (TOTP) code, and this account's ssh key
+# (~/.ssh/cluster_ed25519) is installed on the cluster. From then on the key replaces the password, and
+# only the TOTP code is asked for. The connection stays open in the background until it drops
+# (network trouble, a login-node reboot); run this again then.
+set -euo pipefail
+
+key=~/.ssh/cluster_ed25519
+if [[ ! -f $key ]]; then
+  # No passphrase, so reconnecting needs only the one-time code. Agents on this account can read the key:
+  # that is safe only if your center always asks for a one-time code too (SETUP.md, step 9, "The ssh key").
+  ssh-keygen -q -t ed25519 -N "" -C "$(id -un)@$(hostname -s) for HPC" -f "$key"
+fi
+
+if ssh -O check cluster-login 2> /dev/null; then
+  echo "HPC is already connected."
+else
+  rm -f ~/.ssh/cm-cluster.sock   # left behind by a connection that died
+  ssh -fN -o ControlMaster=yes -o ControlPersist=yes -o BatchMode=no cluster-login
+  echo "Connected. Agents on this account can now run: ssh cluster '<command>'"
+fi
+
+# Through the open connection: make sure HPC knows this account's key.
+if ! ssh cluster-login "grep -qF '$(cut -d' ' -f2 "$key.pub")' ~/.ssh/authorized_keys 2> /dev/null"; then
+  ssh cluster-login 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys' < "$key.pub"
+  echo "Installed this account's ssh key on the cluster: next time only the TOTP code is needed."
+fi

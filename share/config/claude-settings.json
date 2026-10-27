@@ -1,0 +1,81 @@
+{
+  "remoteControlAtStartup": true,
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/claude-statusline"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook working"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook working"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook needs-permission"
+          }
+        ]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook waiting-for-input"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook finished-turn"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agent-status-hook ended"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(hpc-cancel:*)",
+      "Bash(lab-cancel:*)",
+      "Bash(lab-rm:*)",
+      "Bash(/usr/local/bin/hpc-cancel:*)",
+      "Bash(/usr/local/bin/lab-cancel:*)",
+      "Bash(/usr/local/bin/lab-rm:*)"
+    ]
+  }
+}

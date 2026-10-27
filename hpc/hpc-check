@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Say whether the shared HPC connection is up (exit 0) or not (exit 1).
+
+if ssh -O check cluster-login 2>/dev/null; then
+  echo "HPC: connected"
+else
+  rm -f ~/.ssh/cm-cluster.sock   # a connection that died can leave its socket behind
+  echo "HPC: not connected (the PI needs to run hpc-connect)"
+  exit 1
+fi

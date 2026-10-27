@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Start this account's tmux session "agents" with its first window, "snap", which records every
+# window's screen in /srv/agents/status (agent-snapshots). `lab up` adds the lab's windows.
+set -euo pipefail
+
+if tmux has-session -t agents 2>/dev/null; then
+  echo "Already running. Attach with: tmux attach -t agents"
+  exit 0
+fi
+tmux new-session -d -s agents -n snap -c ~ agent-snapshots
+echo "Started. Attach with: tmux attach -t agents   (Ctrl-b w: pick a window, Ctrl-b d: detach)"

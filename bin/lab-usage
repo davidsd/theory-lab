@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# lab-usage: measure the lab's finite resources and write /srv/lab/state/usage/summary.json and
+# summary.txt. The leads and the director see summary.txt at every pass; `lab spawn` and
+# hpc-submit check budgets; `lab usage` shows it. The watchdog runs this every 30 minutes, as hpc.
+#   Codex:   the plan's usage (percent of each window, when it resets), from the newest Codex
+#            session record on this account, and tokens per project from usage/codex-runs.tsv.
+#   Claude:  the plan's usage as last seen by an interactive session's status line, and the lab's
+#            own Claude runs this week (the rest of the plan is the PI's).
+#   HPC: SUs this month per project and for the lab, actual (sacct) where HPC reports them
+#            and estimated otherwise, against the budgets; and, if HPC_BALANCE_CMD is set, the center's report on the allocation.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+mkdir -p "$USAGE"
+now_epoch=$(date +%s)
+
+# --- Codex
+# The newest session record (of the last two weeks) that has a plan reading; a session that just
+# started may not have one yet.
+limits=null
+while IFS= read -r record; do
+  reading=$(grep '"rate_limits"' "$record" | tail -1 | jq -c '.payload.rate_limits // empty' 2> /dev/null)
+  if [[ -n $reading ]]; then
+    limits=$reading
+    break
+  fi
+done < <(find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -mmin -20160 -print0 2> /dev/null |
+  xargs -0 -r ls -t 2> /dev/null)
+tokens_by_project() {  # tokens_by_project <seconds back>: {"project": input + output tokens, ...}
+  awk -F'\t' -v t="$(( now_epoch - $1 ))" '$1 >= t {s[$2] += $6 + $8} END {for (p in s) print p "\t" s[p]}' \
+    "$USAGE/codex-runs.tsv" 2> /dev/null | jq -R -s 'split("\n") | map(select(. != "") | split("\t") | {(.[0]): (.[1] | tonumber)}) | add // {}'
+}
+codex=$(jq -n --argjson l "${limits:-null}" --argjson now "$now_epoch" \
+  --argjson day "$(tokens_by_project 86400)" --argjson week "$(tokens_by_project 604800)" '{
+    windows: ([$l.primary?, $l.secondary?] | map(select(. != null)
+      # A reading from before a reset says nothing about the new window: count it as empty.
+      | (.window_minutes * 60) as $w
+      | if .resets_at <= $now then .used_percent = 0 | .resets_at += ((($now - .resets_at) / $w | floor) + 1) * $w else . end
+      | . + {elapsed_percent: ((($now - (.resets_at - $w)) / $w * 100) | floor)})),
+    credits: ($l.credits.balance? // null),
+    tokens_24h: $day, tokens_7d: $week}')
+
+# --- Claude
+claude_limits=$(jq -c --argjson now "$now_epoch" 'if (.seven_day.resets_at // 0) > $now then . else null end' \
+  "$USAGE/claude-limits.json" 2> /dev/null || echo null)
+[[ -n $claude_limits ]] || claude_limits=null
+claude_runs=$(awk -F'\t' -v t="$(( now_epoch - 7 * 86400 ))" '$1 >= t' "$USAGE/claude-runs.tsv" 2> /dev/null | grep -c . || true)
+claude=$(jq -n --argjson l "$claude_limits" --argjson runs "$claude_runs" \
+  --argjson cap "$CLAUDE_LAB_RUNS_PER_WEEK" --argjson stop "$CLAUDE_LAB_STOP_PERCENT" \
+  '{plan: $l, lab_runs_7d: $runs, lab_runs_cap: $cap, stop_percent: $stop}')
+
+# --- HPC: this month's released jobs from the ledger, with actual use where the job finished
+month_start=$(date -d "$(date +%Y-%m-01)" +%s)
+ledger=$LAB/state/hpc-ledger.tsv
+jobs=$(awk -F'\t' -v t="$month_start" '$1 >= t && ($11 == "auto" || $11 == "approved") {print $5}' "$ledger" 2> /dev/null | paste -sd, -)
+actual=""
+hpc_ok=false
+if hpc-check > /dev/null 2>&1; then
+  hpc_ok=true
+  [[ -n $jobs ]] && actual=$(timeout 120 ssh -n cluster "sacct -X -n -P -j $jobs -o JobID,Partition,AllocNodes,AllocCPUS,ElapsedRaw,State" 2> /dev/null)
+  # Optional: a site command on the cluster that prints the allocation's balance (HPC_BALANCE_CMD in lab.conf).
+  [[ -n ${HPC_BALANCE_CMD:-} ]] && timeout 120 ssh -n cluster "$HPC_BALANCE_CMD" > "$USAGE/hpc-allocation.txt.new" 2>&1 &&
+    mv "$USAGE/hpc-allocation.txt.new" "$USAGE/hpc-allocation.txt"
+fi
+# Per job: actual SUs so far from sacct (finished or running; 0 while pending), or the ledger's estimate
+# when sacct doesn't know the job or HPC is unreachable.
+sus_by_project=$(ACTUAL=$actual awk -F'\t' -v t="$month_start" -v whole=",${HPC_WHOLE_NODE_PARTITIONS:-}," -v cores="${HPC_CORES_PER_NODE:-0}" '
+  BEGIN {
+    n = split(ENVIRON["ACTUAL"], lines, "\n")
+    for (i = 1; i <= n; i++) {
+      split(lines[i], f, "|")
+      if (f[1] == "" || f[2] ~ /gpu/) continue   # GPU partitions are usually charged differently; adapt if needed
+      used[f[1]] = index(whole, "," f[2] ",") ? f[3] * cores * f[5] / 3600 : f[4] * f[5] / 3600   # whole-node partitions (lab.conf)
+    }
+  }
+  $1 >= t && ($11 == "auto" || $11 == "approved") {
+    s[$3] += ($5 in used) ? used[$5] : $10
+  }
+  END {for (p in s) printf "%s\t%d\n", p, s[p]}' "$ledger" 2> /dev/null |
+  jq -R -s 'split("\n") | map(select(. != "") | split("\t") | {(.[0]): (.[1] | tonumber)}) | add // {}')
+held=$(awk -F'\t' '$11 == "held"' "$ledger" 2> /dev/null | grep -c . || true)
+budgets=$(jq -c '.projects | map_values(.hpc_sus_month // null) | with_entries(select(.value != null))' "$LAB/registry.json")
+hpc=$(jq -n --argjson s "$sus_by_project" --argjson b "$budgets" --argjson lab "$HPC_LAB_SUS_PER_MONTH" \
+  --argjson held "$held" --argjson ok "$hpc_ok" --arg month "$(date +%Y-%m)" '{
+    month: $month, lab_sus: ([$s[]] | add // 0), lab_budget: $lab, held_jobs: $held, connected: $ok,
+    by_project: (($b | map_values(0)) + $s | to_entries | map({(.key): {sus: ($s[.key] // 0), budget: ($b[.key] // null)}}) | add // {})}')
+
+jq -n --arg time "$(now)" --argjson codex "$codex" --argjson claude "$claude" --argjson hpc "$hpc" \
+  '{time: $time, codex: $codex, claude: $claude, hpc: $hpc}' > "$USAGE/summary.json.new" &&
+  mv "$USAGE/summary.json.new" "$USAGE/summary.json"
+
+# --- The readable version
+{
+  echo "Resources as of $(now) (\`lab usage\`):"
+  jq -r '.codex.windows[] | "- Codex plan: \(.used_percent)% of the \(if .window_minutes >= 1440 then "\(.window_minutes / 1440)-day" else "\(.window_minutes / 60)-hour" end) window used, \(.elapsed_percent)% of the window elapsed; resets \(.resets_at | strftime("%a %H:%M UTC"))."' "$USAGE/summary.json"
+  echo "- Codex pace: $(codex_pressure) (ok: no limits; ahead: no new explorers; stop: only verifiers start, leads pause)."
+  jq -r '"- Codex tokens in the last 7 days: " + ((.codex.tokens_7d | to_entries | sort_by(-.value) | map("\(.key) \(.value / 1e6 * 10 | floor / 10)M") | join(", ")) // "" | if . == "" then "none recorded" else . end) + "."' "$USAGE/summary.json"
+  jq -r '"- Claude: the lab ran \(.claude.lab_runs_7d) of its \(.claude.lab_runs_cap) runs this week" + (if .claude.plan.seven_day then "; the plan is \(.claude.plan.seven_day.used_percentage)% used this week (the lab stops at \(.claude.stop_percent)%)" else "" end) + "."' "$USAGE/summary.json"
+  jq -r '.hpc | "- HPC this month: \(.lab_sus) of the lab'"'"'s \(.lab_budget) SUs" + (if .held_jobs > 0 then "; \(.held_jobs) jobs held for approval" else "" end) + (if .connected then "" else " (HPC not connected: estimates only)" end) + "."' "$USAGE/summary.json"
+  jq -r '.hpc.by_project | to_entries[] | "  - \(.key): \(.value.sus) SUs" + (if .value.budget then " of \(.value.budget)" else "" end)' "$USAGE/summary.json"
+} > "$USAGE/summary.txt.new" && mv "$USAGE/summary.txt.new" "$USAGE/summary.txt"

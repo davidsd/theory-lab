@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# hpc-submit: how agents submit HPC jobs.
+#   hpc-submit --project <p> --issue <n> --reason "<why>" -- 'cd <folder on the cluster> && sbatch [options] <script>'
+# Submits the job held, estimates its cost in SUs from what Slurm says it will use, and records it in
+# /srv/lab/state/hpc-ledger.tsv. If the job fits the automatic limits in /etc/agentbox/lab.conf
+# (per job, per day, the lab's monthly budget) and the project's monthly budget (`lab budget`), it's
+# released at once. Otherwise it stays held and an inbox issue asks the PI; the watchdog releases or
+# cancels it when they answer. GPU jobs, job arrays and heterogeneous jobs always ask.
+#
+# Ledger columns: epoch, time, project, issue, job, partition, nodes, CPUs, hours, SUs, status
+# (auto, held, approved, cancelled, gone), reason, approval issue URL.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+usage() {
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+project="" issue="" reason=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project) project=$2; shift 2 ;;
+    --issue) issue=$2; shift 2 ;;
+    --reason) reason=$2; shift 2 ;;
+    --) shift; break ;;
+    *) usage ;;
+  esac
+done
+command=${1:-}
+[[ -n $project && -n $issue && -n $reason && -n $command ]] || usage
+if [[ ! $command =~ ^(cd\ [^\;\&\|]+\ \&\&\ )?sbatch\ ([^\;\&\|]+)$ || $command == *$'\n'* || $command == *'$('* || $command == *'`'* ||
+      $command == *[\<\>\(]* ]]; then
+  # < > ( would allow redirection or process substitution, e.g. sbatch <(sbatch big.sh), which skips the hold
+  die "The command must be one 'sbatch ...', optionally after 'cd <folder> &&', with nothing chained, substituted, redirected or on another line (put complex commands in a batch script)."
+fi
+prefix=${BASH_REMATCH[1]} args=${BASH_REMATCH[2]}
+# --hold goes on the sbatch parsed above (a folder name containing "sbatch " must not take it), and a job may not
+# itself submit jobs through --wrap: both would start work without the budget check.
+if [[ $args == *--wrap* && $args == *sbatch* ]]; then
+  die "A --wrap command may not call sbatch: submit each job through hpc-submit."
+fi
+held_command="${prefix}sbatch --hold $args"
+
+hours_of() {  # hours_of <Slurm time limit>: whole hours, rounded up; UNLIMITED counts as a million
+  local limit=$1 days=0 h m s
+  [[ $limit == UNLIMITED || $limit == Partition_Limit ]] && { echo 1000000; return; }
+  if [[ $limit == *-* ]]; then
+    days=${limit%%-*}
+    limit=${limit#*-}
+  fi
+  IFS=: read -r h m s <<<"$limit"
+  echo $(( (days * 86400 + 10#$h * 3600 + 10#${m:-0} * 60 + 10#${s:-0} + 3599) / 3600 ))
+}
+
+output=$(timeout 120 ssh -n cluster "$held_command") || die "Submission failed: $output"
+[[ $output =~ Submitted\ batch\ job\ ([0-9]+) ]] || die "Unexpected answer from sbatch: $output"
+job=${BASH_REMATCH[1]}
+
+# A metadata lookup can fail after sbatch accepted the held job. Never turn
+# missing metadata into a zero-SU release; leave this job held for recovery.
+info=$(timeout 120 ssh -n cluster "scontrol show job -o $job") ||
+  die "Job $job remains held: metadata lookup failed. Inspect this job; do not submit a duplicate."
+field() { grep -oE "(^| )$1=[^ ]+" <<<"$info" | head -1 | cut -d= -f2; }
+partition=$(field Partition)
+nodes=$(field NumNodes)
+nodes=${nodes%%-*}
+cpus=$(field NumCPUs)
+limit=$(field TimeLimit)
+[[ -n $partition && $nodes =~ ^[0-9]+$ && $cpus =~ ^[0-9]+$ ]] ||
+  die "Job $job remains held: missing or invalid partition/node/CPU metadata. Inspect this job; do not submit a duplicate."
+# scontrol normalizes finite time limits to [days-]HH:MM:SS.
+[[ $limit == UNLIMITED || $limit == Partition_Limit || $limit =~ ^([0-9]+-)?[0-9]+:[0-9]{2}:[0-9]{2}$ ]] ||
+  die "Job $job remains held: missing or invalid TimeLimit. Inspect this job; do not submit a duplicate."
+hours=$(hours_of "$limit") || die "Job $job remains held: cannot parse TimeLimit."
+[[ $hours =~ ^[0-9]+$ ]] && (( nodes > 0 && cpus > 0 && hours > 0 )) ||
+  die "Job $job remains held: nonpositive cost inputs. Inspect this job; do not submit a duplicate."
+special=""
+if [[ -n $(field ArrayTaskId) || -n $(field ArrayJobId) ]]; then special="job arrays always ask"
+elif [[ -n $(field HetJobId) ]] || (( $(grep -c . <<<"$info") > 1 )); then special="heterogeneous jobs always ask"
+elif [[ $partition == gpu* ]]; then special="GPU jobs always ask"
+fi
+# Partitions that charge whole nodes (HPC_WHOLE_NODE_PARTITIONS, comma-separated) cost nodes x cores per node.
+if [[ ",${HPC_WHOLE_NODE_PARTITIONS:-}," == *",$partition,"* ]]; then
+  [[ $HPC_CORES_PER_NODE =~ ^[1-9][0-9]*$ ]] || { echo "Set HPC_CORES_PER_NODE in lab.conf." >&2; exit 1; }
+  sus=$(( nodes * HPC_CORES_PER_NODE * hours ))
+else
+  sus=$(( cpus * hours ))
+fi
+
+# Decide and record under one lock, so two submissions can't both squeeze under a limit.
+ledger=$LAB/state/hpc-ledger.tsv
+exec 9>"$LAB/state/ledger.lock"
+flock 9
+released_since() {  # released_since <epoch> [project]: estimated SUs of the jobs released since then
+  awk -F'\t' -v t="$1" -v p="${2:-}" '$1 >= t && ($11 == "auto" || $11 == "approved") && (p == "" || $3 == p) && $10 > 0 {s += $10}
+    END {print s + 0}' "$ledger" 2> /dev/null || echo 0
+}
+month_start=$(date -d "$(date +%Y-%m-01)" +%s)
+today=$(released_since $(( $(date +%s) - 86400 )))
+month=$(released_since "$month_start")
+month_project=$(released_since "$month_start" "$project")
+budget=$(project_field "$project" hpc_sus_month)
+
+why=$special
+if [[ -n $why ]]; then :
+elif (( sus > HPC_AUTO_SUS_PER_JOB )); then why="over the per-job limit of $HPC_AUTO_SUS_PER_JOB SUs"
+elif (( today + sus > HPC_AUTO_SUS_PER_DAY )); then why="over the lab's daily limit of $HPC_AUTO_SUS_PER_DAY SUs ($today used)"
+elif (( month + sus > HPC_LAB_SUS_PER_MONTH )); then why="over the lab's monthly budget of $HPC_LAB_SUS_PER_MONTH SUs ($month used)"
+elif [[ -n $budget ]] && (( month_project + sus > budget )); then why="over $project's monthly budget of $budget SUs ($month_project used)"
+fi
+
+url=""
+if [[ -z $why ]]; then
+  if timeout 120 ssh -n cluster "scontrol release $job"; then
+    status=auto
+    echo "HPC job $job submitted and released (~$sus SUs; $partition, $nodes nodes, $hours h)."
+  else
+    status=held
+    echo "HPC job $job was submitted but couldn't be released; it stays held. Say so in your issue." >&2
+  fi
+else
+  status=held
+  url=$(timeout 60 gh issue create -R "$ORG/$project" --title "HPC job $job needs approval (~$sus SUs)" \
+    --label inbox --label ask --label hpc-approval --assignee "$PI_GITHUB" --body "For issue #$issue: $reason
+
+- Command: \`$command\`
+- Partition $partition, $nodes nodes, $cpus CPUs, time limit $hours h: ~$sus SUs
+- Held because $why.
+- Released this month: $month SUs for the lab, $month_project for $project. Estimates from time limits; \`lab usage\` shows actual use.
+
+Comment \`approve\` to release it, or \`cancel\` to cancel it. Only comments from @$PI_GITHUB count." < /dev/null)
+  if [[ -n $url ]]; then
+    echo "HPC job $job is HELD ($why). The PI has been asked: $url"
+    echo "Carry on with other work; the job starts if they approve."
+  else
+    echo "HPC job $job is HELD ($why), but asking the PI failed. Say so in your issue." >&2
+  fi
+fi
+
+[[ -f $ledger ]] || install -m 644 /dev/null "$ledger"   # only hpc writes the ledger; others may read it
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "$job" \
+  "$partition" "$nodes" "$cpus" "$hours" "$sus" "$status" "${reason//[$'\t\n']/ }" "$url" >> "$ledger"

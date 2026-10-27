@@ -1,0 +1,45 @@
+# Settings for the lab: /etc/agentbox/lab.conf. It belongs to root, so agents can't change it; edit it
+# from your own login with `sudo nano /etc/agentbox/lab.conf`. One KEY=value per line, no spaces in
+# values; numbers are plain digits. Changes apply at the next pass or check, without restarting anything.
+
+ORG=CHANGE-ME                   # the GitHub organization holding the lab's repos
+PI_GITHUB=CHANGE-ME             # your own GitHub username: only your comments approve things
+NTFY_URL=https://ntfy.sh/CHANGE-ME-to-a-long-random-topic   # where push notifications go (keep the topic secret)
+SLACK_BOT_NAME=lab-bot          # optional: the Slack app's display name (slack/manifest.yaml)
+
+# Codex: the lab paces itself to the plan's weekly allowance. When usage runs this many points ahead
+# of the time elapsed in the week, no new explorers start; at 95% used, only verifiers start.
+CODEX_AHEAD_PERCENT=15
+# Once the weekly window is used up, Codex can keep running on the account's purchased credits, if any:
+# at most this many credits per 7-day window, spread evenly over what is left of it, never below the floor.
+# 0 turns credit use off.
+CODEX_CREDITS_PER_WINDOW=0
+CODEX_CREDITS_FLOOR=5000
+
+# Claude: the lab's share of the plan, which you also use yourself.
+CLAUDE_LAB_RUNS_PER_WEEK=30      # Claude worker/verifier runs per week
+CLAUDE_LAB_STOP_PERCENT=60       # no Claude runs once the plan's weekly usage passes this
+
+# Timing
+LEAD_INTERVAL_MIN=20            # how often each lead checks for changes
+LEAD_MAX_IDLE_HOURS=3           # a lead runs at least this often even when nothing changed
+DIRECTOR_INTERVAL_MIN=60
+DIGEST_HOUR=7                   # the daily digest is written after this hour (the machine's time zone)
+
+# --- Optional: an HPC cluster (Slurm) reached over ssh by the hpc account. Leave WATCH_HPC=no without one.
+WATCH_HPC=no                    # yes: push a notification when the cluster connection is down
+HPC_NAME=the-cluster            # a short name for messages
+HPC_LOGIN_HOST=login.example.edu   # the cluster's ssh login host
+HPC_USER=CHANGE-ME              # your username on the cluster (the lab works under your allocation)
+HPC_SCRATCH_ROOT=/scratch/CHANGE-ME   # your scratch folder there; the lab uses <root>/lab/<project>/
+HPC_HOME_ROOT=/home/CHANGE-ME         # your home there; the lab keeps builds in <root>/lab/<project>/
+HPC_BALANCE_CMD=                # optional: path of a script on the cluster that prints the allocation balance (no spaces)
+# Cost model, in SUs (core-hours). Most centers charge core-hours; some partitions charge whole nodes. List those
+# here (comma-separated, empty if none) with the cores per node; check your center's user guide.
+HPC_WHOLE_NODE_PARTITIONS=        # e.g. batch,test
+HPC_CORES_PER_NODE=CHANGE-ME      # cores per node in those partitions
+# A job is released automatically only if it fits all of these, and the project's own monthly budget if it
+# has one (`lab budget`); otherwise it waits, held, for your approval.
+HPC_AUTO_SUS_PER_JOB=2000
+HPC_AUTO_SUS_PER_DAY=10000
+HPC_LAB_SUS_PER_MONTH=50000     # the lab's share of the allocation; the rest stays yours

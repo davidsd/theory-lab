@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# hpc-cancel: how agents cancel their own HPC jobs.
+#   hpc-cancel --project <p> --issue <n> --reason "<why>" <job> [<job>...]
+# Cancels a job only if it is the lab's: listed in the ledger for <p>, or running from a folder under
+# the lab's HPC paths for <p> (so jobs that a workflow tool submits by itself count too). It never touches the PI's
+# own jobs. Marks held ledger rows cancelled (released ones keep their SUs) and logs every cancel to /srv/lab/state/cancels.tsv.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+usage() {
+  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+project="" issue="" reason=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project) project=$2; shift 2 ;;
+    --issue) issue=$2; shift 2 ;;
+    --reason) reason=$2; shift 2 ;;
+    --*) usage ;;
+    *) break ;;
+  esac
+done
+[[ -n $project && -n $issue && -n $reason && $# -gt 0 ]] || usage
+[[ $project =~ ^[A-Za-z0-9._-]+$ ]] || die "Bad project name."
+
+ledger=$LAB/state/hpc-ledger.tsv
+log=$LAB/state/cancels.tsv
+roots=("${HPC_SCRATCH_ROOT:?set HPC_SCRATCH_ROOT in lab.conf}/lab/$project/")
+[[ -n ${HPC_HOME_ROOT:-} ]] && roots+=("$HPC_HOME_ROOT/lab/$project/")
+
+failed=0
+for job in "$@"; do
+  [[ $job =~ ^[0-9]+(_[0-9]+)?$ ]] || { echo "Skipping '$job': not a job id." >&2; failed=1; continue; }
+  base=${job%%_*}
+  why=""
+  if awk -F'\t' -v j="$base" -v p="$project" '$5 == j && $3 == p {f=1} END {exit !f}' "$ledger"; then
+    why="in the ledger"
+  else
+    info=$(timeout 60 ssh -n cluster "scontrol show job -o $base" 2>&1) || { echo "Job $job: $info" >&2; failed=1; continue; }
+    workdir=$(grep -oE '(^| )WorkDir=[^ ]+' <<<"$info" | head -1 | cut -d= -f2)
+    for r in "${roots[@]}"; do [[ $workdir/ == "$r"* ]] && why="runs in $workdir"; done
+  fi
+  if [[ -z $why ]]; then
+    echo "Refusing job $job: not a $project lab job (not in the ledger, not run from the lab's folders). Ask on the issue." >&2
+    failed=1; continue
+  fi
+  if out=$(timeout 60 ssh -n cluster "scancel $job" 2>&1); then
+    echo "Cancelled HPC job $job ($why)."
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "$job" "${reason//[$'\t\n']/ }" >> "$log"
+    (
+      flock 9
+      awk -F'\t' -v OFS='\t' -v j="$base" -v p="$project" '$5 == j && $3 == p && $11 == "held" {$11 = "cancelled"} {print}' \
+        "$ledger" > "$ledger.tmp" && cat "$ledger.tmp" > "$ledger" && rm -f "$ledger.tmp"
+    ) 9>"$LAB/state/ledger.lock"
+  else
+    echo "scancel $job failed: $out" >&2; failed=1
+  fi
+done
+exit $failed

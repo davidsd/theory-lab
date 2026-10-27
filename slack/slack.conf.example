@@ -1,0 +1,27 @@
+# Slack channels the lab reads or posts in: /srv/lab/slack.conf. The PI owns this file; agents don't edit it.
+# Read by lab-slack (sync runs from hpc's crontab every 10 minutes) and lab-slack-listen.
+#
+# workspace <name> [token=<file>]      default token file: ~/.config/lab/slack-<name>.token (hpc only, chmod 600)
+#   The listener also needs the app-level token in ~/.config/lab/slack-<name>.apptoken.
+#
+# pi <workspace> <slack user id>       the PI's own Slack user (profile -> ... -> Copy member ID). Only this
+#   user may approve held cluster jobs by DM, and the PI's DMs reach the director.
+#
+# channel <workspace> <channel> projects=<p1,p2> mode=read|draft|post [posters=lead,worker] [every=6h] [per_hour=4]
+#   The app must also be invited to the channel (/invite @<bot>). Its history is mirrored only into the
+#   listed projects' data/slack/ (outside git). read: no posting. draft: posts go to the PI's inbox for
+#   approval first. post: posts go out directly, signed, logged, rate-limited.
+#
+# Mentions and direct messages (lab-slack-listen) are answered in any channel listed here, whatever its mode:
+#   a mention is someone asking. Channels not listed get no answers; an invite to one asks the PI.
+#   People link their own Slack account (DM the bot `link github <h>` or `link gitlab <h>`), saved in
+#   state/slack/people.json. `person` lines are only for people who can't or won't link themselves.
+#
+# person <workspace> <slack user id, e.g. UABCD1234> <github handle, or gitlab:<handle>>
+#   (user id only: display names aren't unique and anyone can change theirs. Profile → ⋮ → Copy member ID.)
+#   So agents know who is who. Instructions count only from the PI and the collaborators in the
+#   project's AGENTS.md "People".
+
+# workspace myworkspace
+# pi myworkspace UXXXXXXXXXX
+# channel myworkspace my-project-channel projects=my-project mode=draft posters=lead every=6h

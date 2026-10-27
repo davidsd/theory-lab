@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# lab: run the lab's projects and agents.
+#
+#   lab status                          projects, agents and jobs at a glance
+#   lab up                              start everything that should be running (e.g. after a reboot)
+#   lab new <project> [--account agent|hpc] [--describe "<one line>"] [--charter <file>]
+#                                       create a project (GitHub repo + folder); the PI approves its charter
+#   lab adopt <project> [--account agent|hpc] [--describe "<one line>"] [--charter <file>]
+#                                       bring an existing repo, already in the lab's organization, into
+#                                       the lab: adds the lab's files next to its own; the PI approves
+#   lab start <project>                 mark a project active and start its lead
+#   lab pause <project>                 the lead stops; running jobs finish
+#   lab resume <project>
+#   lab retire <project> [--no-summary] final summary, stop its agents, archive its repo
+#   lab limit <project> <n>             how many jobs the project may run at once
+#   lab budget <project> <SUs>          the project's monthly HPC budget (0: none of its own)
+#   lab usage [--refresh]               Codex, Claude and HPC use against limits and budgets
+#   lab spawn <project> worker|explorer|verifier --issue <n> [--model codex|claude] [--effort <level>]
+#             [--cpus <n>] [--mem <size>] [--hours <n>]
+#                                       start an agent on one issue, as a Slurm job on this machine
+#   lab chat <project>|lab [codex|claude]
+#                                       talk about a project, or with the director about the whole lab
+#                                       ("lab"), in a new tmux window
+#   lab notify <title> <message> [url]  push a notification to the PI's phone
+#   lab init                            one-time: put the lab folder on GitHub
+#
+# Projects belong to a Unix account: hpc if they use HPC, agent otherwise. hpc may run lab
+# commands for the agent account; lab switches accounts by itself when needed.
+set -euo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+need_project() {
+  [[ -n ${1:-} ]] || usage 1
+  project_exists "$1" || die "No project named $1 (see lab status)."
+}
+
+# Run a subcommand as the account that owns the project, in a separate process (so its failures
+# show in its exit status).
+as_owner() {  # as_owner <project> <subcommand> [args...]
+  local project=$1; shift
+  local account
+  account=$(project_field "$project" account)
+  if [[ $account == "$(id -un)" ]]; then
+    "$0" "$@"
+  else
+    sudo -n -H -u "$account" "$0" "$@"
+  fi
+}
+
+ensure_session() { tmux has-session -t agents 2>/dev/null || start-agents > /dev/null; }
+
+# ensure_window <name> <process pattern> <command>: make sure the command runs in its own window of
+# this account's session, restarting it in its window if its process (matched with pgrep -f) has gone.
+ensure_window() {
+  ensure_session
+  if ! tmux list-windows -t agents -F '#W' | grep -qx -- "$1"; then
+    tmux new-window -d -t agents: -n "$1" -c "$HOME"
+  elif pgrep -u "$(id -un)" -f "$2" > /dev/null; then
+    return 0
+  fi
+  tmux send-keys -t "agents:$1" "$3" Enter
+}
+
+render_files() {  # render_files <folder> KEY=value...: fill in {{KEY}} in every file under the folder
+  local folder=$1 file text pair
+  shift
+  while IFS= read -r -d '' file; do
+    text=$(cat "$file")
+    for pair in "$@"; do
+      text=${text//"{{${pair%%=*}}}"/"${pair#*=}"}   # quoted, so an & in the value stays an &
+    done
+    printf '%s\n' "$text" > "$file"
+  done < <(find "$folder" -type f -name '*.md' -print0)
+}
+
+cmd_status() {
+  local jobs
+  jobs=$(lab_jobs || true)
+  printf '%-24s %-6s %-9s %5s %5s  %s\n' PROJECT ACCOUNT STATUS LIMIT JOBS LEAD
+  local project status lead count
+  for project in $(jq -r '.projects | keys[]' "$LAB/registry.json"); do
+    status=$(project_field "$project" status)
+    [[ $status == retired ]] && continue
+    count=$(awk -v p="lab:$project:" 'index($2, p) == 1' <<<"$jobs" | grep -c . || true)
+    lead=-
+    pgrep -f "lab-loop lead $project\$" > /dev/null && lead=running
+    printf '%-24s %-6s %-9s %5s %5s  %s\n' "$project" "$(project_field "$project" account)" "$status" \
+      "$(project_field "$project" limit)" "$count" "$lead"
+  done
+  echo
+  echo "Jobs:"
+  if [[ -n $jobs ]]; then sed 's/^/  /' <<<"$jobs"; else echo "  none"; fi
+  echo
+  echo "Machine: $(sinfo -h -o '%C' | awk -F/ '{print $1 " of " $4 " CPUs allocated"}')"
+  pgrep -f 'lab-loop director$' > /dev/null && echo "Director: running" || echo "Director: not running"
+  pgrep -f '/watchdog$' > /dev/null && echo "Watchdog: running" || echo "Watchdog: not running"
+  [[ $(id -un) == hpc && -n ${HPC_LOGIN_HOST:-} ]] && hpc-check || true
+}
+
+cmd_up() {
+  ensure_session
+  if [[ $(id -un) == hpc ]]; then
+    ensure_window rc 'claude remote-control' "cd $PROJECTS && claude remote-control --name $(hostname)-hpc --spawn same-dir"
+    ensure_window watchdog '/watchdog$' watchdog
+    ensure_window director 'lab-loop director$' "lab-loop director"
+    ensure_window dashboard 'dashboard/serve.py' "python3 $LAB/dashboard/serve.py --port 8765"
+  fi
+  local project
+  for project in $(projects_where account "$(id -un)"); do
+    [[ $(project_field "$project" status) == active ]] && ensure_window "lead-$project" "lab-loop lead $project\$" "lab-loop lead $project"
+  done
+  if [[ $(id -un) == hpc ]] && id agent &> /dev/null; then   # the second account is optional
+    sudo -n -H -u agent "$0" up
+  fi
+  echo "$(id -un): running. Attach with: tmux attach -t agents"
+}
+
+cmd_new() {
+  local project=${1:-} account=hpc describe="" charter=""
+  [[ $project =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Project names use lowercase letters, digits and -."
+  shift
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --account) account=$2; shift 2 ;;
+      --describe) describe=$2; shift 2 ;;
+      --charter) charter=$2; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ $account == agent || $account == hpc ]] || die "--account is agent or hpc."
+  [[ -z $charter || -r $charter ]] || die "Can't read $charter."
+  project_exists "$project" && die "There is already a project named $project."
+  if [[ -n $charter ]]; then   # copy it where the owning account can read it
+    cp "$charter" "$LAB/state/charter-$project.md.new" && mv "$LAB/state/charter-$project.md.new" "$LAB/state/charter-$project.md"
+    charter=$LAB/state/charter-$project.md
+  fi
+  registry_update '.projects[$p] = {account: $a, status: "proposed", limit: 3, description: $d, created: $t}' \
+    --arg p "$project" --arg a "$account" --arg d "$describe" --arg t "$(date +%F)"
+  if ! as_owner "$project" _create "$project" "$charter"; then
+    registry_update 'del(.projects[$p])' --arg p "$project"
+    die "Creating $project failed (see above); nothing was registered. Remove $PROJECTS/$project and the GitHub repo if they were made."
+  fi
+}
+
+cmd_adopt() {
+  local project=${1:-} account=hpc describe="" charter=""
+  [[ $project =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Give the repo's name in $ORG."
+  shift
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --account) account=$2; shift 2 ;;
+      --describe) describe=$2; shift 2 ;;
+      --charter) charter=$2; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ $account == agent || $account == hpc ]] || die "--account is agent or hpc."
+  [[ -z $charter || -r $charter ]] || die "Can't read $charter."
+  project_exists "$project" && die "There is already a project named $project."
+  [[ -e $PROJECTS/$project ]] && die "$PROJECTS/$project already exists."
+  gh repo view "$ORG/$project" --json name > /dev/null 2>&1 || die "There is no repo $ORG/$project (transfer it there first)."
+  if [[ -n $charter ]]; then
+    cp "$charter" "$LAB/state/charter-$project.md.new" && mv "$LAB/state/charter-$project.md.new" "$LAB/state/charter-$project.md"
+    charter=$LAB/state/charter-$project.md
+  fi
+  registry_update '.projects[$p] = {account: $a, status: "proposed", limit: 3, description: $d, created: $t, adopted: true}' \
+    --arg p "$project" --arg a "$account" --arg d "$describe" --arg t "$(date +%F)"
+  if ! as_owner "$project" _adopt "$project" "$charter"; then
+    registry_update 'del(.projects[$p])' --arg p "$project"
+    die "Adopting $project failed (see above); nothing was registered. Remove $PROJECTS/$project if it was made."
+  fi
+}
+
+cmd__adopt() {  # as the owner: clone the repo, add the lab's files it lacks, open the charter-approval issue
+  local project=$1 charter=${2:-} folder=$PROJECTS/$1 file rel added=() describe url
+  gh repo clone "$ORG/$project" "$folder" -- -q
+  if [[ -n $charter && -e $folder/CHARTER.md ]]; then
+    rm -rf "$folder"
+    die "$ORG/$project already has a CHARTER.md; adopt it without --charter."
+  fi
+  describe=$(project_field "$project" description)
+  # Add only the template's files the repo doesn't have; never overwrite the repo's own.
+  while IFS= read -r -d '' file; do
+    rel=${file#"$SHARE/project-template/"}
+    [[ $rel == .gitignore ]] && continue
+    if [[ ! -e $folder/$rel ]]; then
+      mkdir -p "$(dirname "$folder/$rel")"
+      cp "$file" "$folder/$rel"
+      added+=("$folder/$rel")
+    fi
+  done < <(find "$SHARE/project-template" -type f -print0)
+  if [[ -f $folder/.gitignore ]]; then   # merge the template's ignores into the repo's
+    while IFS= read -r line; do
+      grep -qxF -- "$line" "$folder/.gitignore" || printf '%s\n' "$line" >> "$folder/.gitignore"
+    done < "$SHARE/project-template/.gitignore"
+  else
+    cp "$SHARE/project-template/.gitignore" "$folder/.gitignore"
+  fi
+  [[ -n $charter ]] && cp "$charter" "$folder/CHARTER.md"
+  local pair text
+  for file in "${added[@]}"; do   # fill in the placeholders, in the added files only
+    [[ $file == *.md ]] || continue
+    text=$(cat "$file")
+    for pair in PROJECT="$project" DESCRIPTION="${describe:-(to be written)}" DATE="$(date +%F)" ORG="$ORG" PI="$PI_GITHUB"; do
+      text=${text//"{{${pair%%=*}}}"/"${pair#*=}"}
+    done
+    printf '%s\n' "$text" > "$file"
+  done
+  git -C "$folder" add -A
+  git -C "$folder" commit -q -m "lab: join the lab (AGENTS.md, CHARTER.md, STATUS.md, notebook/, people/ next to the existing files)"
+  git -C "$folder" push -q
+  ensure_labels "$ORG/$project"
+  url=$(gh issue create -R "$ORG/$project" --title "Approve the charter for $project" \
+    --label inbox --label ask --label charter-approval --assignee "$PI_GITHUB" \
+    --body "The charter: https://github.com/$ORG/$project/blob/$(git -C "$folder" branch --show-current)/CHARTER.md
+
+This project already existed; the lab added its own files next to the repo's and changed none of them.
+Edit the charter if you like, then comment \`approve\` to start the project, or \`cancel\` to drop it.")
+  echo "Adopted $ORG/$project into $folder"
+  echo "Waiting for the PI to approve the charter: $url"
+}
+
+cmd__create() {  # as the owner: folder, GitHub repo, and the charter-approval issue
+  local project=$1 charter=${2:-} folder=$PROJECTS/$1
+  mkdir -p "$folder"
+  cp -r "$SHARE/project-template/." "$folder/"
+  local describe
+  describe=$(project_field "$project" description)
+  render_files "$folder" PROJECT="$project" DESCRIPTION="${describe:-(to be written)}" DATE="$(date +%F)" ORG="$ORG" PI="$PI_GITHUB"
+  [[ -n $charter ]] && cp "$charter" "$folder/CHARTER.md"
+  git -C "$folder" init -q -b main
+  git -C "$folder" add -A
+  git -C "$folder" commit -q -m "Start project $project"
+  if gh repo view "$ORG/$project" --json name > /dev/null 2>&1; then
+    # the PI created the (empty) repo, so the bot's token needs no Administration permission
+    [[ $(gh api "repos/$ORG/$project" --jq .size 2> /dev/null) == 0 ]] ||
+      die "$ORG/$project already exists and isn't empty; use \`lab adopt $project\` for an existing repo."
+    git -C "$folder" remote add origin "https://github.com/$ORG/$project.git"
+    git -C "$folder" push -q -u origin main
+  else
+    gh repo create "$ORG/$project" --private --source "$folder" --remote origin --push > /dev/null
+  fi
+  ensure_labels "$ORG/$project"
+  local url
+  url=$(gh issue create -R "$ORG/$project" --title "Approve the charter for $project" \
+    --label inbox --label ask --label charter-approval --assignee "$PI_GITHUB" \
+    --body "The charter: https://github.com/$ORG/$project/blob/main/CHARTER.md
+
+Edit it if you like, then comment \`approve\` to start the project, or \`cancel\` to drop it.")
+  echo "Created $folder and https://github.com/$ORG/$project"
+  echo "Waiting for the PI to approve the charter: $url"
+}
+
+cmd_start() {
+  need_project "${1:-}"
+  registry_update '.projects[$p].status = "active"' --arg p "$1"
+  as_owner "$1" _start-lead "$1"
+}
+
+cmd__start_lead() {
+  ensure_window "lead-$1" "lab-loop lead $1\$" "lab-loop lead $1"
+  echo "Project $1 is active; its lead runs in window lead-$1 of $(id -un)'s tmux session."
+}
+
+cmd_pause() {
+  need_project "${1:-}"
+  registry_update '.projects[$p].status = "paused"' --arg p "$1"
+  echo "Project $1 is paused: its lead stops at its next check; running jobs finish."
+}
+
+cmd_resume() {
+  need_project "${1:-}"
+  cmd_start "$1"
+}
+
+cmd_retire() {
+  need_project "${1:-}"
+  local project=$1 summary=yes
+  [[ ${2:-} == --no-summary ]] && summary=no
+  as_owner "$project" _stop "$project"
+  if [[ $summary == yes && $(project_field "$project" status) != proposed ]]; then
+    echo "Asking the lead for a final summary..."
+    as_owner "$project" _final-pass "$project"
+  fi
+  registry_update '.projects[$p].status = "retired"' --arg p "$project"
+  gh repo archive "$ORG/$project" --yes > /dev/null
+  echo "Project $project is retired; https://github.com/$ORG/$project is archived (read-only)."
+}
+
+cmd__final_pass() { lab-loop lead "$1" --final; }
+
+cmd__stop() {  # as the owner: stop the lead and cancel the project's jobs
+  tmux kill-window -t "agents:lead-$1" 2>/dev/null || true
+  rm -f "$LAB/state/pass-lead-$1.running"
+  local jobs
+  jobs=$(lab_jobs "$1" | awk '{print $1}')
+  [[ -z $jobs ]] || scancel $jobs
+}
+
+cmd_limit() {
+  need_project "${1:-}"
+  [[ ${2:-} =~ ^[0-9]+$ ]] || die "Usage: lab limit <project> <n>"
+  registry_update '.projects[$p].limit = ($n | tonumber)' --arg p "$1" --arg n "$2"
+  echo "Project $1 may now run $2 jobs at once."
+}
+
+cmd_budget() {
+  need_project "${1:-}"
+  [[ ${2:-} =~ ^[0-9]+$ ]] || die "Usage: lab budget <project> <SUs per month>"
+  if [[ $2 == 0 ]]; then
+    registry_update 'del(.projects[$p].hpc_sus_month)' --arg p "$1"
+    echo "Project $1 has no HPC budget of its own; the lab's applies."
+  else
+    registry_update '.projects[$p].hpc_sus_month = ($n | tonumber)' --arg p "$1" --arg n "$2"
+    echo "Project $1 may use $2 HPC SUs a month without asking the PI."
+  fi
+}
+
+cmd_usage() {
+  [[ ${1:-} == --refresh ]] && lab-usage
+  cat "$USAGE/summary.txt" 2> /dev/null || echo "No measurements yet; the watchdog makes them every 30 minutes (or: lab usage --refresh, as hpc)."
+}
+
+cmd_spawn() {
+  need_project "${1:-}"
+  local project=$1
+  if [[ $(project_field "$project" account) != "$(id -un)" ]]; then
+    as_owner "$project" spawn "$@"
+    return
+  fi
+  local role=${2:-} issue="" model=codex effort="" cpus=4 mem=16G hours=12
+  [[ $role == worker || $role == explorer || $role == verifier ]] || die "The role is worker, explorer or verifier."
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --issue) issue=$2; shift 2 ;;
+      --model) model=$2; shift 2 ;;
+      --effort) effort=$2; shift 2 ;;
+      --cpus) cpus=$2; shift 2 ;;
+      --mem) mem=$2; shift 2 ;;
+      --hours) hours=$2; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ $issue =~ ^[0-9]+$ ]] || die "Give the task's issue number: --issue <n>"
+  [[ $model == codex || $model == claude ]] || die "--model is codex or claude."
+  [[ -z $effort || $effort =~ ^(low|medium|high|xhigh|max)$ ]] || die "--effort is low, medium, high, xhigh or max."
+  [[ $cpus =~ ^[1-9][0-9]{0,2}$ ]] || die "--cpus is a whole number of CPUs, e.g. 2."
+  [[ $mem =~ ^[1-9][0-9]{0,5}[MG]$ ]] || die "--mem is a size like 16G or 4000M."
+  [[ $hours =~ ^[1-9][0-9]{0,2}$ ]] || die "--hours is a whole number of hours, e.g. 8."
+  [[ $(project_field "$project" status) == active ]] || die "Project $project isn't active."
+  if [[ $model == codex ]]; then
+    case $(codex_pressure) in
+      stop) [[ $role == verifier ]] || die "Codex is at its limit until the window resets (lab usage); only verifiers start now." ;;
+      ahead) [[ $role == explorer ]] && die "The lab is using Codex faster than the allowance lasts (lab usage); explorers wait until the pace recovers." ;;
+    esac
+  else
+    claude_room || die "The lab's Claude allowance for this week is used up (lab usage); the rest of the plan is the PI's."
+  fi
+  local jobs limit
+  jobs=$(lab_jobs "$project")
+  limit=$(project_field "$project" limit)
+  if awk -v n="lab:$project:$role:$issue" '$2 == n' <<<"$jobs" | grep -q .; then
+    die "A $role is already working on issue #$issue."
+  fi
+  # An issue assigned to someone other than the lab's agents is theirs (a collaborator's claim).
+  local others
+  others=$(timeout 60 gh issue view "$issue" -R "$ORG/$project" --json assignees --jq '.assignees[].login' < /dev/null 2> /dev/null |
+    grep -vx -- "$(agents_login)" | paste -sd, - || true)
+  [[ -z $others ]] || die "Issue #$issue is assigned to $others; it's theirs. Comment on it instead."
+  if (( $(grep -c . <<<"$jobs" || true) >= limit )); then
+    die "Project $project already runs $limit jobs, its limit. Wait for one to finish, or ask the PI for more."
+  fi
+  local folder=$PROJECTS/$project
+  mkdir -p "$folder/logs"
+  local job
+  job=$(sbatch --parsable --job-name="lab:$project:$role:$issue" --cpus-per-task="$cpus" --mem="$mem" \
+    --time="$hours:00:00" --signal=B:USR1@300 --output="$folder/logs/%j-$role-$issue.out" --chdir="$folder" \
+    --export="ALL,LAB_PROJECT=$project,LAB_ROLE=$role,LAB_ISSUE=$issue,LAB_MODEL=$model,LAB_EFFORT=$effort" \
+    "$(command -v lab-worker)")
+  echo "Started $role for issue #$issue as Slurm job $job ($model${effort:+, effort $effort}, $cpus CPUs, $mem, up to $hours h)."
+}
+
+cmd_chat() {
+  local project=${1:-} tool=${2:-claude} folder prompt
+  [[ $tool == codex || $tool == claude ]] || die "Chat with codex or claude."
+  if [[ $project == lab ]]; then   # a conversation with the director, about the whole lab
+    folder=$LAB
+    prompt="You're the lab's director, talking with the PI in person (not one of your periodic passes). First read roles/director.md (your role), PRIORITIES.md, findings.md, director-notes.md and registry.json in $LAB, and the STATUS.md of each active project in $PROJECTS. Then help the PI plan: current and new projects, priorities, agent limits and budgets. For a new project, draft its charter with them, write it to $LAB/state/charter-<name>.md, and create the project with lab new (see lab help); it starts when they comment approve on the charter issue, so give them the link. Change limits, budgets and project states with lab commands only when they decide to. Record their decisions in director-notes.md (and in PRIORITIES.md when they're about what they want to hear about), then commit and push $LAB, so your periodic passes follow them. Answer plainly and briefly."
+  else
+    need_project "$project"
+    folder=$PROJECTS/$project
+    prompt="You're talking with the PI about project $project (folder $folder; board: GitHub issues in $ORG/$project). Before answering, read CHARTER.md, STATUS.md, DECISIONS.md, the newest notebook entries and the open issues. Answer plainly. If the PI gives an instruction or makes a decision, record it as a comment on the relevant issue (or a new issue) starting with \"From the PI (via chat):\" so the project's lead acts on it."
+  fi
+  ensure_session
+  local name=chat-$project n=2
+  while tmux list-windows -t agents -F '#W' | grep -qx -- "$name"; do
+    name=chat-$project-$n
+    n=$((n + 1))
+  done
+  tmux new-window -d -t agents: -n "$name" -c "$folder"
+  tmux send-keys -t "agents:$name" "$tool $(printf '%q' "$prompt")" Enter
+  if [[ -n ${TMUX:-} ]]; then
+    tmux select-window -t "agents:$name"
+  else
+    exec tmux attach-session -t agents \; select-window -t "agents:$name"
+  fi
+}
+
+cmd_notify() {
+  [[ $# -ge 2 ]] || usage 1
+  notify "$@"
+}
+
+cmd_init() {
+  [[ -n ${ORG:-} && -n ${PI_GITHUB:-} ]] || die "Fill in $LAB_CONF first (sudo nano $LAB_CONF, from your own login)."
+  [[ -z $CONF_PLACEHOLDERS ]] ||
+    echo "Warning: still CHANGE-ME in $LAB_CONF, treated as unset:$CONF_PLACEHOLDERS" >&2
+  [[ -d $LAB/.git ]] && die "$LAB is already a git repo."
+  render_files "$LAB" ORG="$ORG" PI="$PI_GITHUB"
+  git -C "$LAB" init -q -b main
+  git -C "$LAB" add -A
+  git -C "$LAB" commit -q -m "Start the lab"
+  gh repo create "$ORG/lab" --private --source "$LAB" --remote origin --push > /dev/null
+  ensure_labels "$ORG/lab"
+  echo "The lab folder is now https://github.com/$ORG/lab"
+}
+
+command=${1:-help}
+shift || true
+case $command in
+  help|-h|--help) usage ;;
+  status|up|new|adopt|start|pause|resume|retire|limit|budget|usage|spawn|chat|notify|init|_create|_adopt|_start-lead|_final-pass|_stop)
+    "cmd_${command//-/_}" "$@" ;;
+  *) usage 1 ;;
+esac

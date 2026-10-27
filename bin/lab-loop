@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# lab-loop: the working cycle of the director and of each project's lead.
+#   lab-loop director
+#   lab-loop lead <project> [--final]
+# Each pass is a fresh, non-interactive agent session that reads the files and the board, acts, and
+# writes back, so nothing depends on an agent remembering anything. A lead skips a pass when nothing
+# changed (no new comments, notebook entries or job changes), but runs at least every
+# LEAD_MAX_IDLE_HOURS. `lab up` starts these loops in tmux windows; each pass prints one line there.
+set -uo pipefail
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
+
+lead_pass() {  # lead_pass <project> [extra instructions]
+  local project=$1 extra=${2:-} folder=$PROJECTS/$1 stamp prompt model code
+  stamp=$(date +%Y%m%d-%H%M%S)
+  model=$(project_field "$project" lead_model)
+  [[ $model == claude ]] && ! claude_room && model=codex   # the lab's Claude share is used up
+  mkdir -p "$folder/logs"
+  prompt=$(render_role lead PROJECT="$project" ORG="$ORG" PI="$PI_GITHUB" \
+    LIMIT="$(project_field "$project" limit)" ACCOUNT="$(id -un)")
+  prompt+=$'\n\n## Right now\n\n'"Time: $(now)"$'\n\n'"This project's Slurm jobs (id, name, state, elapsed):"$'\n'"$(lab_jobs "$project")"
+  prompt+=$'\n\n'"$(cat "$USAGE/summary.txt" 2>/dev/null)"
+  [[ -n $extra ]] && prompt+=$'\n\n'"$extra"
+  echo "$(now) lead pass started"
+  touch "$LAB/state/pass-lead-$project.running"
+  run_agent "${model:-codex}" "$folder" "$prompt" "$folder/logs/lead-$stamp.jsonl" "$folder/logs/lead-last.md"
+  code=$?
+  record_run "${model:-codex}" "$folder/logs/lead-$stamp.jsonl" "$project" lead -
+  rm -f "$LAB/state/pass-lead-$project.running"
+  echo "$(now) lead pass ended (exit $code): $(head -c 300 "$folder/logs/lead-last.md" 2>/dev/null | tr '\n' ' ')"
+}
+
+fingerprint() {  # changes whenever the project's jobs, notebook or issues change
+  local project=$1
+  {
+    lab_jobs "$project" | awk '{print $1, $2, $3}'   # not the elapsed time, which always changes
+    find "$PROJECTS/$project/notebook" -type f -printf '%p %T@\n' 2>/dev/null
+    gh issue list -R "$ORG/$project" --state all --limit 200 --json number,updatedAt < /dev/null 2>/dev/null
+  } | cksum
+}
+
+lead_loop() {
+  local project=$1 last_fingerprint="" last_pass=0 status current
+  rm -f "$LAB/state/pass-lead-$project.running"   # left by a pass that was killed
+  while :; do
+    load_conf   # settings changes apply without a restart
+    status=$(project_field "$project" status)
+    if [[ $status == retired || -z $status ]]; then
+      echo "Project $project is retired; this loop stops."
+      return
+    fi
+    if [[ $status == active && $(codex_pressure) == stop ]]; then
+      echo "$(now) Codex is at its limit (lab usage); waiting for the window to reset."
+    elif [[ $status == active ]]; then
+      # Bring in collaborators' and workers' pushes, so they count as changes.
+      git -C "$PROJECTS/$project" pull -q --rebase --autostash < /dev/null > /dev/null 2>&1 || true
+      current=$(fingerprint "$project")
+      if [[ $current != "$last_fingerprint" ]] || (( $(date +%s) - last_pass >= LEAD_MAX_IDLE_HOURS * 3600 )); then
+        lead_pass "$project"
+        last_pass=$(date +%s)
+        last_fingerprint=$(fingerprint "$project")   # after the lead's own changes
+      fi
+    fi
+    sleep $(( LEAD_INTERVAL_MIN * 60 ))
+  done
+}
+
+director_pass() {  # director_pass [extra instructions]
+  local extra=${1:-} stamp prompt
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$LAB/state/logs"
+  prompt=$(render_role director ORG="$ORG" PI="$PI_GITHUB")
+  prompt+=$'\n\n## Right now\n\n'"Time: $(now)"$'\n\n'"Projects (registry.json):"$'\n'"$(jq -c '.projects' "$LAB/registry.json")"
+  prompt+=$'\n\n'"The lab's Slurm jobs (id, name, state, elapsed):"$'\n'"$(lab_jobs)"
+  prompt+=$'\n\n'"$(cat "$USAGE/summary.txt" 2>/dev/null)"
+  [[ -n $extra ]] && prompt+=$'\n\n'"$extra"
+  echo "$(now) director pass started${extra:+ (with digest)}"
+  touch "$LAB/state/pass-director.running"
+  run_agent codex "$LAB" "$prompt" "$LAB/state/logs/director-$stamp.jsonl" "$LAB/state/director-last.md"
+  local code=$?
+  record_run codex "$LAB/state/logs/director-$stamp.jsonl" lab director -
+  rm -f "$LAB/state/pass-director.running"
+  echo "$(now) director pass ended (exit $code): $(head -c 300 "$LAB/state/director-last.md" 2>/dev/null | tr '\n' ' ')"
+  return $code
+}
+
+director_loop() {
+  local today extra
+  rm -f "$LAB/state/pass-director.running"
+  while :; do
+    load_conf
+    today=$(date +%F)
+    extra=""
+    if [[ $(cat "$LAB/state/last-digest" 2>/dev/null) != "$today" ]] && (( 10#$(date +%H) >= DIGEST_HOUR )); then
+      extra="Also write today's digest (see \"Daily digest\" above)."
+    fi
+    if [[ $(codex_pressure) == stop ]]; then
+      echo "$(now) Codex is at its limit (lab usage); waiting for the window to reset."
+    elif director_pass "$extra" && [[ -n $extra ]]; then
+      echo "$today" > "$LAB/state/last-digest"
+    fi
+    sleep $(( DIRECTOR_INTERVAL_MIN * 60 ))
+  done
+}
+
+case ${1:-} in
+  director)
+    director_loop ;;
+  lead)
+    [[ -n ${2:-} ]] || die "Usage: lab-loop lead <project> [--final]"
+    if [[ ${3:-} == --final ]]; then
+      lead_pass "$2" "This is the project's final pass: it is being retired. Put a final summary at the top of STATUS.md (what was achieved, where the results are, open questions), comment on each open issue that it was not finished and close it, then commit and push."
+    else
+      lead_loop "$2"
+    fi ;;
+  *)
+    sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1 ;;
+esac

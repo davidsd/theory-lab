@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && git fetch -q 2>/dev/null; echo \"[repo sync] $(git status -sb | head -1)\"; echo '[repo sync] Shared repo: git pull --rebase before working, and push small commits often (AGENTS.md section 2).'"
+          }
+        ]
+      }
+    ]
+  }
+}

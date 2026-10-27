@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Runs in the "snap" window of each account's tmux session (start-agents starts it).
+# Every minute it saves the end of every other window's screen to
+# /srv/agents/status/screen-<account>-<window>.txt. A file is rewritten only when its screen changed,
+# so the file's modification time is when the agent in that window last showed any activity.
+
+umask 027   # screens can show anything an agent printed: readable by the lab's group only, never by others
+dir=/srv/agents/status
+user=$(id -un)
+session=agents
+
+while tmux has-session -t "$session" 2>/dev/null; do
+  declare -A open_windows=()
+  while read -r index name; do
+    [[ $name == snap ]] && continue
+    file="$dir/screen-$user-${name//[^A-Za-z0-9_-]/_}.txt"
+    open_windows[$file]=1
+    screen=$(tmux capture-pane -p -J -t "$session:$index" -S -60)
+    if [[ ! -f $file || $screen != "$(<"$file")" ]]; then
+      printf '%s\n' "$screen" > "$file"
+    fi
+  done < <(tmux list-windows -t "$session" -F '#{window_index} #{window_name}')
+
+  # Remove the files of windows that have been closed.
+  for file in "$dir/screen-$user-"*.txt; do
+    [[ -e $file && -z ${open_windows[$file]:-} ]] && rm -f "$file"
+  done
+  unset open_windows
+  sleep 60
+done
