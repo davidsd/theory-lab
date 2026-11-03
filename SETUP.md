@@ -85,8 +85,10 @@ git clone https://github.com/<where-you-got-this>/theory-lab.git && cd theory-la
 sudo bash install/install.sh --pi "$USER"            # add --no-second-account if you have one set of subscriptions
 ```
 
-It installs packages, Slurm, the `hpc` (and `agent`) accounts, `/srv/lab`, `/srv/projects`, the scripts in
-`/usr/local/bin`, and `/etc/agentbox/lab.conf`. Log out and back in afterwards (you joined group `agents`).
+It installs packages, Slurm with its accounting database (slurmdbd and MariaDB: without accounting, Slurm
+rejects jobs that have to wait in the queue), the `hpc` (and `agent`) accounts with user services that run
+without a login (the agents' pool), `/srv/lab`, `/srv/projects`, the scripts in `/usr/local/bin`, and
+`/etc/agentbox/lab.conf`. Log out and back in afterwards (you joined group `agents`).
 
 Know what it sets up:
 - Third-party installers are fetched and run unpinned (`curl ... | sh`: Tailscale here, Claude Code, Codex and
@@ -95,7 +97,9 @@ Know what it sets up:
   the second account. Since `hpc` also writes the lab's files that `agent`'s runs read, treat the two accounts
   as one trust domain: whoever controls `hpc` controls `agent`.
 
-**Check:** `sinfo` shows one node `idle`; `lab help` prints the commands; `ls /srv/lab` shows LAB-RULES.md.
+**Check:** `sinfo` shows one node `idle`; `sacctmgr show assoc` lists account `lab` with users `hpc` (and
+`agent`); `loginctl show-user hpc -p Linger` says `yes`; `lab help` prints the commands; `ls /srv/lab` shows
+LAB-RULES.md.
 If Slurm's node shows `down` or `drain`: `sudo scontrol update nodename=$(hostname -s) state=resume`, and
 read `/var/log/slurm/slurmd.log` (a RealMemory larger than the machine has is the usual cause).
 
@@ -108,8 +112,17 @@ read `/var/log/slurm/slurmd.log` (a RealMemory larger than the machine has is th
   `openssl rand -hex 16`), subscribe to it in the app, and write `https://ntfy.sh/<topic>`. Anyone who
   knows the topic can read your notifications, so keep it secret.
 - The Claude share (`CLAUDE_LAB_RUNS_PER_WEEK`, `CLAUDE_LAB_STOP_PERCENT`): how much of your Claude plan
-  the lab may use. Start small (e.g. 30 runs, 60%) and raise it once you see the lab's habits.
-- Leave the HPC section for step 9.
+  the lab may use. Start small (e.g. 30 runs, 60%) and raise it once you see the lab's habits. If you buy
+  Claude usage credits and want the lab to keep going past the stop percent, set `CLAUDE_CREDITS=on` (a run
+  that fails for lack of credits pauses Claude for 6 hours). The dashboard estimates the balance from the
+  balances you report: append tab-separated `<epoch> <USD> <note>` lines to `/srv/lab/state/usage/claude-credits.tsv`, or
+  tell the director what the account page shows.
+- The agents' pool (`AGENT_POOL_CPUS`, `AGENT_POOL_MEM_GB`): how many CPUs and GB all of one account's agents
+  share for thinking, git and quick checks. Their computations run in Slurm on the rest of the machine. On a
+  16-CPU machine, 4 CPUs and 24 GB is a reasonable start; `lab-capacity` shows later whether to change it.
+- The ceilings (`<KEY>_MAX` at the end): how far the director may raise a working value on your instruction
+  (`lab set`) without sudo.
+- Leave the HPC section for step 9, and the OpenAI API lines unless you have an API budget for the lab (step 6).
 
 **Check:** `lab notify test "hello"` (as your login) makes your phone buzz.
 
@@ -132,6 +145,14 @@ API keys instead of subscriptions also work (Claude Code reads `ANTHROPIC_API_KE
 OpenAI API key), but pacing in this kit reads the subscription windows; see docs/ADAPTING.md. If you use
 keys, save them to a file yourself (`install -m 600 /dev/null ~/.config/lab/<name>.key` then edit it), and
 never paste them into an agent.
+
+**Optional: OpenAI API credits on top of the Codex plan.** As each lab account, run
+`bash /usr/local/share/agentbox/user-setup.sh --codex-api` (it asks for the key, hidden, and logs Codex in to the
+API in `~/.codex-api`, separate from the plan's login). Then set `CODEX_API_BUDGET_USD` in lab.conf, fill in
+`/srv/lab/codex-api-prices.tsv` from OpenAI's pricing page (until it has prices the lab doesn't use the API),
+and decide in LAB-RULES.md ("Finite resources") which projects may use it. `CODEX_API=on` lets Codex runs go on
+the API when the plan's window is used up; leads can also put a chosen hard task on it with
+`lab spawn ... --api "<why>"`. `lab usage` and the dashboard show the spend.
 
 **Check:** as each account, `gh api user --jq .login` prints the bot's name; `claude -p "say ok"` and
 `codex exec "say ok"` both answer.
@@ -186,15 +207,23 @@ else; if it accepts keys alone, give the key a passphrase (`ssh-keygen -p -f ~/.
 into an ssh-agent only while you run `hpc-connect`, or don't install the key and type your password each time.
 
 1. In lab.conf set `WATCH_HPC=yes`, `HPC_LOGIN_HOST`, `HPC_USER`, `HPC_SCRATCH_ROOT`, `HPC_HOME_ROOT`, the
-   cost model (`HPC_WHOLE_NODE_PARTITIONS`, `HPC_CORES_PER_NODE`) and the budgets (`HPC_AUTO_SUS_PER_JOB`,
-   `HPC_AUTO_SUS_PER_DAY`, `HPC_LAB_SUS_PER_MONTH`). Jobs within all of them start at once; bigger ones are
-   held and appear in your inbox; comment `approve` or `cancel`.
+   cost model (`HPC_WHOLE_NODE_PARTITIONS`, `HPC_CORES_PER_NODE`; for shared partitions that charge memory,
+   `HPC_GB_PER_CORE`, or `HPC_BILLING_PER_SU` if the center's Slurm reports SUs in its billing TRES) and the
+   budgets (`HPC_AUTO_SUS_PER_JOB`, `HPC_AUTO_SUS_PER_DAY`, `HPC_LAB_SUS_PER_MONTH`). Jobs within all of them
+   start at once. A job over only the daily limit is queued quietly (an issue labeled `hpc-queued`, assigned to
+   no one) and released by the watchdog as soon as it fits. Bigger ones are held and appear in your inbox;
+   comment `approve` or `cancel`. Optional, for the dashboard: `HPC_BALANCE_CMD` (a command on the cluster that
+   prints the allocation's balance) and, on a Lustre scratch, `HPC_SCRATCH_FS` and `HPC_SCRATCH_GROUP` (many
+   centers' scratch quota that matters is the group's, shared with everyone in your allocation).
 2. As hpc: `bash /usr/local/share/agentbox/user-setup.sh --hpc` (adds the ssh settings), then `hpc-connect`.
    The first time it asks for your password and code and installs a key; later only the code.
 3. Per project: `lab budget <project> <SUs per month>`.
 4. Write down in LAB-RULES.md anything specific to your center: quotas (bytes and file counts) on scratch
    and home, partitions, typical failures. The rules already say how agents triage failures and keep
    small files off parallel filesystems.
+5. Optional: to let a project's queued jobs skip the daily limit for a while (e.g. a planned burst), tell the
+   director; it writes `/srv/lab/state/hpc-standing.json` (`{"<project>": {"until": <epoch>, "why": "<your
+   words>"}}`). The per-job, monthly and project budgets still apply.
 
 The connection drops now and then (network, login-node reboots). The watchdog pushes "not connected" to your
 phone; run `hpc-connect` again (if it says "already connected" but nothing works, first
@@ -219,6 +248,12 @@ phone; run `hpc-connect` again (if it says "already connected" but nothing works
 4. As hpc, `cp /srv/lab/slack.conf.example /srv/lab/slack.conf` and fill in the workspace, your own
    Slack member id (`pi` line), and channels with their projects and modes. Invite the bot to each channel.
 5. Rerun the installer with `--slack` (adds the cron jobs and the Python environment).
+6. Project summaries: with the `pi` line in slack.conf, leads send you each summary as a DM with the PDF
+   attached (the app needs the `files:write` scope; the manifest has it). To have a project's summaries
+   shared in a channel when you reply `post`, list that channel in slack.conf for the project (mode `draft` or
+   `post`) and write the mapping in LAB-RULES.md ("Project summaries"). Summaries may quote their own channel
+   and use the project's own private data, so map each project only to a channel its collaborators share.
+   For people whose Slack accounts can't be linked by `link github`, add `person` lines (Slack user ids).
 
 **Check:** DM the bot `whoami`; then `link github <your-handle>` and follow its instructions.
 
@@ -235,7 +270,28 @@ To bring in an existing repo: transfer it to the organization and use `lab adopt
 Collaborators: add them to the project repo on GitHub and to the People table in its AGENTS.md. Their own
 agents can then work in the repo under the same protocol.
 
-**Check:** within an hour the project's board has issues and `lab status` shows its jobs.
+**Check:** within an hour the project's board has issues and `lab status` shows its agents (ids a1, a2, ...).
+
+## 12. Optional: approve settings from your phone
+
+Changes to `/etc/agentbox/lab.conf` need sudo, which a phone doesn't have. This installs a root timer that
+applies changes you approve on a GitHub issue:
+
+1. As hpc: `gh issue create -R <org>/lab --title "Settings changes for the PI" --body "Proposals from
+   lab-settings-propose; reply approve P<n> or cancel P<n>."` and note its number.
+2. From **your own** GitHub account, make a fine-grained token: resource owner the organization, repository
+   `lab` only, permission Issues: Read-only. Root reads the issue with it, never with the bot's token.
+3. `sudo bash install/install.sh --settings <issue number>` (from the kit's folder): it asks for the token
+   (hidden), installs `lab-settings-apply` with its timer (every 3 minutes) and the list of keys you may change
+   this way with their hard maxima, `/etc/agentbox/settings-max.conf`. Edit that list now (`sudo nano`).
+
+From then on, ask the director in plain words ("raise the daily SU limit to 20000"); it posts a proposal
+`P<n>` with the old and new values; you comment `approve P<n>`. Only your account's comment counts, only for
+listed keys up to their maxima, only if lab.conf still has the old value, and never for an edited proposal.
+The watchdog posts the result on the issue (and with Slack, in your DM).
+
+**Check:** `systemctl list-timers lab-settings.timer` shows it; `sudo /usr/local/sbin/lab-settings-apply`
+exits without an error.
 
 ## Daily use
 
@@ -246,17 +302,27 @@ anything about the lab, give it instructions, have it relay decisions to the boa
 talk to the same chat from the Claude app on your phone or from claude.ai/code on any laptop, without ssh.
 Keep it open; when its context fills up it summarizes itself and carries on.
 
-- Read the daily digest (an issue in `<org>/lab`) and your inbox. Answer `ask`s when convenient; the
-  lab follows the stated default meanwhile. Interrupts come to your phone.
+- Read the project summaries (twice a day, when something happened), the daily digest (an issue in
+  `<org>/lab`: one line per project, and every open question with its default) and your inbox. Answer `ask`s
+  when convenient; the lab follows the stated default meanwhile. Interrupts come to your phone.
 - Steer by commenting on any issue (your comments come first), or through the director.
 - `lab limit|pause|resume|retire|budget`, `lab usage`, `lab status`, `talk <project> <issue>` (attach to a
-  running Codex worker), `tmux attach -t agents` (all windows).
+  running Codex worker), `tmux attach -t agents` (all windows). Tell the director to change a working value or
+  a model (`lab set`, `lab model`; `lab set` alone shows them all). A paused project's lead still looks in every
+  72 hours if something changed, and reports only significant progress.
+- After updating the kit's scripts (rerun the installer), `lab-reload-loops` as hpc restarts the director and
+  lead loops between passes; running agents and jobs are not touched (don't use `lab _stop` for this: it
+  cancels the project's jobs).
 - Things only you can do: sudo (system packages, raising Slurm's CPUs for oversubscription), reconnecting
   the cluster, approving charters and held jobs, adding collaborators, editing lab.conf.
 
 ## Troubleshooting
 
-- **Nothing starts:** `lab usage`. "stop" means Codex's weekly window is used up (or the Claude share).
+- **Nothing starts:** `lab usage`. "stop" means Codex's weekly window is used up (or the Claude share). A
+  `lab spawn` that says "systemd-run failed" means the account's user manager isn't running:
+  `sudo loginctl enable-linger hpc agent`.
+- **Slurm jobs stay pending with reason InvalidAccount:** Slurm has no accounting associations. Check
+  `systemctl status slurmdbd` and `sacctmgr show assoc`; rerunning the installer sets them up.
 - **A Claude session waits at a permission prompt:** the watchdog pushes it after 10 minutes. The lab runs
   agents with `--permission-mode auto`; allow rules for the lab's own tools are in
   `/usr/local/share/agentbox/config/claude-settings.json`.
