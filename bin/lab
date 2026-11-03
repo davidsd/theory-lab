@@ -119,8 +119,8 @@ cmd_up() {
     ensure_window dashboard 'dashboard/serve.py' "python3 $LAB/dashboard/serve.py --port 8765"
   fi
   local project
-  for project in $(projects_where account "$(id -un)"); do
-    [[ $(project_field "$project" status) == active ]] && ensure_window "lead-$project" "lab-loop lead $project\$" "lab-loop lead $project"
+  for project in $(projects_where account "$(id -un)"); do   # paused projects' loops run watch passes
+    [[ $(project_field "$project" status) =~ ^(active|paused)$ ]] && ensure_window "lead-$project" "lab-loop lead $project\$" "lab-loop lead $project"
   done
   if [[ $(id -un) == hpc ]] && id agent &> /dev/null; then   # the second account is optional
     sudo -n -H -u agent "$0" up
@@ -278,7 +278,7 @@ cmd__start_lead() {
 cmd_pause() {
   need_project "${1:-}"
   registry_update '.projects[$p].status = "paused"' --arg p "$1"
-  echo "Project $1 is paused: its lead stops at its next check; running jobs finish."
+  echo "Project $1 is paused: its lead stops working at its next check (it still looks in every 72 h if something changed); running jobs finish."
 }
 
 cmd_resume() {
