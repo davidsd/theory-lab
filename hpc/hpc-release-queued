@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""hpc-release-queued: release HPC jobs that hpc-submit held only because of the lab's rolling 24-hour limit,
+as soon as they fit every limit again. The watchdog runs it every 5 minutes (as hpc, with WATCH_HPC=yes); the
+Slack listener runs it too. Such a job is within the budgets the PI set, only early, so nobody is asked.
+
+A job counts as queued when it is `held` in state/hpc-ledger.tsv, its issue (labeled hpc-queued) is open, and
+the issue says "Held because over the lab's daily limit". It is released when it fits the per-job limit, the
+daily limit, the lab's monthly budget and its project's monthly budget, with the effective values from lib.sh
+(lab.conf and limits.conf). Jobs held for any other reason stay the PI's to approve.
+
+Optional standing approvals: state/hpc-standing.json, {"<project>": {"until": <epoch>, "why": "<the PI's words>"}},
+written by the director only on the PI's explicit instruction and with an expiry. While one is in force, that
+project's queued jobs skip the daily limit; every other limit still applies.
+
+  hpc-release-queued            release what fits; print one line per job released
+  hpc-release-queued --dry-run  only say what would be released
+"""
+import datetime, fcntl, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+LAB = Path(os.environ.get("LAB_DIR", "/srv/lab"))
+LEDGER = LAB / "state" / "hpc-ledger.tsv"
+LOCK = LAB / "state" / "ledger.lock"
+STANDING = LAB / "state" / "hpc-standing.json"
+LIB = Path(os.environ.get("AGENTBOX_SHARE", "/usr/local/share/agentbox")) / "lib.sh"
+QUEUED_MARK = "Held because over the lab's daily limit"
+KEYS = ("HPC_AUTO_SUS_PER_JOB", "HPC_AUTO_SUS_PER_DAY", "HPC_LAB_SUS_PER_MONTH")
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def limits():
+    """The effective HPC limits, as every other lab script sees them (lib.sh's load_conf)."""
+    out = subprocess.run(["bash", "-c", f"source {LIB}; " + "; ".join(f'echo "${k}"' for k in KEYS)],
+                         capture_output=True, text=True, timeout=60).stdout.split()
+    if len(out) != len(KEYS) or not all(x.isdigit() for x in out):
+        raise SystemExit("hpc-release-queued: can't read the limits from lib.sh")
+    return dict(zip(KEYS, map(int, out)))
+
+
+def standing_daily(standing, project, now):
+    a = standing.get(project) or {}
+    try:
+        return float(a.get("until", 0)) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def fits(row, rows, conf, budgets, standing, now, month0):
+    """Whether a queued ledger row fits every limit now (pure: no I/O). rows are all ledger rows (lists of 13
+    fields); budgets is project -> monthly SUs; standing as in state/hpc-standing.json."""
+    sus, project = int(row[9] or 0), row[2]
+
+    def used(since, p=None):
+        return sum(int(f[9] or 0) for f in rows if int(f[0]) >= since and f[10] in ("auto", "approved")
+                   and (p is None or f[2] == p))
+
+    budget = budgets.get(project)
+    return not (sus > conf["HPC_AUTO_SUS_PER_JOB"]
+                or (not standing_daily(standing, project, now) and used(now - 86400) + sus > conf["HPC_AUTO_SUS_PER_DAY"])
+                or used(month0) + sus > conf["HPC_LAB_SUS_PER_MONTH"]
+                or (budget and used(month0, project) + sus > int(budget)))
+
+
+def gh(*args):
+    return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+
+
+def queued(row):
+    """The row's issue is open and says the job is held only by the daily limit."""
+    r = gh("issue", "view", row[12], "--json", "state,body")
+    try:
+        info = json.loads(r.stdout)
+    except ValueError:
+        return False
+    return info.get("state") == "OPEN" and QUEUED_MARK in (info.get("body") or "")
+
+
+def main():
+    dry = "--dry-run" in sys.argv[1:]
+    if not LEDGER.exists():
+        return
+    conf = limits()
+    reg = read_json(LAB / "registry.json", {}).get("projects", {})
+    budgets = {p: v.get("hpc_sus_month") for p, v in reg.items() if v.get("hpc_sus_month")}
+    standing = read_json(STANDING, {})
+    done = []
+    with open(LOCK, "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        rows = [l.split("\t") for l in LEDGER.read_text().splitlines() if l.count("\t") >= 12]
+        now = time.time()
+        month0 = datetime.datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+        for f in rows:
+            # job ids go into ssh commands: only plain numbers (the ledger is a file, not a trusted source)
+            if f[10] != "held" or not re.fullmatch(r"[0-9]+", f[4]) or not f[12]:
+                continue
+            if not fits(f, rows, conf, budgets, standing, now, month0) or not queued(f):
+                continue
+            if dry:
+                print(f"would release {f[4]} ({f[2]} #{f[3]}, ~{f[9]} SUs)")
+                continue
+            if subprocess.run(["hpc-check"], capture_output=True, timeout=60).returncode:
+                break
+            if subprocess.run(["ssh", "-n", "cluster", f"scontrol release {f[4]}"],
+                              capture_output=True, timeout=120).returncode:
+                continue
+            f[10] = "auto"   # counts against the limits for the rows after it
+            done.append(f)
+        if done:
+            tmp = LEDGER.with_suffix(".tsv.tmp")
+            tmp.write_text("\n".join("\t".join(f) for f in rows) + "\n")
+            os.chmod(tmp, 0o644)
+            tmp.replace(LEDGER)
+    for f in done:
+        if standing_daily(standing, f[2], time.time()):
+            why = (standing.get(f[2]) or {}).get("why", "")
+            note = (f"Released HPC job {f[4]} automatically under the PI's standing approval for {f[2]}'s jobs held "
+                    f"only by the daily limit ({why}); it fits every other limit.")
+        else:
+            note = (f"Released HPC job {f[4]} automatically: it now fits the daily limit and every other limit, so "
+                    "it is within the budget the PI set and needs no approval.")
+        gh("issue", "comment", f[12], "--body", note)
+        gh("issue", "close", f[12])
+        print(f"released {f[4]} ({f[2]} #{f[3]}, ~{f[9]} SUs)")
+
+
+if __name__ == "__main__":
+    main()
