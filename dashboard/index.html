@@ -76,7 +76,9 @@ function jobCard(j){
   return `<div class="card"><div class="top"><span class="dot ${j.state==="running"?"run":"pend"}"></span>
     <span class="role">${esc(j.kind)}</span><span class="name"><a href="${url(j.url)}" target="_blank" rel="noopener">#${esc(j.issue)} ${esc(j.title)}</a></span>
     ${j.model==="?"&&j.state!=="running"?"":pill(j.model,j.model_label)}</div>
-    <div class="meta">job ${esc(j.job)} · ${esc(j.state)} ${esc(j.elapsed)} of ${esc(j.limit)} · ${j.state==="running"?`${esc(j.cpus)} CPUs${j.cpu_used!=null?` (using ${j.cpu_used.toFixed(1)})`:""} · ${gb(j.rss)} of a ${esc(j.mem)} cap`:`asks ${esc(j.cpus)} CPUs, ${esc(j.mem)} cap`}</div>
+    ${j.pool?`<div class="meta">agent ${esc(j.job)} · running ${esc(j.elapsed)} of ${esc(j.limit)} · in the agent pool (up to ${esc(j.cpus)} CPUs${j.cpu_used!=null?`, using ${j.cpu_used.toFixed(1)}`:""}) · ${gb(j.rss)} of a ${esc(j.mem)} cap</div>`+
+      ((j.compute||[]).length?`<div class="meta">Slurm: ${j.compute.map(c=>`job ${esc(c.job)} ${esc(c.state)} ${esc(c.elapsed)}, ${esc(c.cpus)} CPUs`).join(" · ")}</div>`:"")
+    :`<div class="meta">job ${esc(j.job)} · ${esc(j.state)} ${esc(j.elapsed)} of ${esc(j.limit)} · ${j.state==="running"?`${esc(j.cpus)} CPUs${j.cpu_used!=null?` (using ${j.cpu_used.toFixed(1)})`:""} · ${gb(j.rss)} of a ${esc(j.mem)} cap`:`asks ${esc(j.cpus)} CPUs, ${esc(j.mem)} cap`}</div>`}
     ${j.message?latest("Latest",j.updated,j.message,"job"+j.job):`<div class="meta" style="margin-top:6px">${note}</div>`}</div>`}
 let ORG="";
 // A button opens a pre-filled request in ORG/lab for the PI to submit; the director applies it.
@@ -95,6 +97,7 @@ function projectHTML(l,jobs){
   return `<section class="proj"><div class="ph"><h2><a href="${url(l.url)}" target="_blank" rel="noopener">${esc(l.project)}</a></h2>
     <span class="meta">${esc(l.status)} · ${esc(l.account)} account</span>${controls(l)}
     <span class="meta"><span class="slots" title="running / waiting / free">${slots}</span> ${running} of ${l.limit} slots busy${waiting?`, ${waiting} waiting`:""}</span></div>
+    ${(l.people||[]).length?`<div class="meta" style="margin:2px 0 6px">With ${l.people.map(p=>`<a href="${url(p.handles[0].url)}" target="_blank" rel="noopener" title="${esc(p.handles.map(h=>h.handle).join(", "))}${p.role?" · "+esc(p.role):""}">${esc(p.name)}</a>`).join(", ")}</div>`:""}
     <div class="card"><div class="top"><span class="dot ${l.running?"run":"idle"}"></span><span class="role">lead</span>${pill(l.model,l.model_label)}
       <span class="meta">${l.running?"in a pass since "+ago(l.since):"idle between passes"}</span></div>
       ${latest(l.running?"Latest":"Last pass",l.updated,l.message,"lead-"+l.project)}</div>
@@ -104,7 +107,9 @@ function machineHTML(m){
   if(!m)return"";
   const a=m.alloc??0,t=m.slurm_cpus||m.cpus,busy=m.busy;
   return `<div class="card"><div class="top"><span class="name">CPUs</span><span class="meta">agentbox, ${m.cpus} in all</span></div>
-    ${meter("Given to jobs",100*a/t,`${a} of ${t}`+(a>=t?" · new jobs wait":""),null,75,100)}
+    ${meter("Given to Slurm jobs",100*a/t,`${a} of ${t}`+(a>=t?" · new jobs wait":""),null,75,100)}
+    ${(m.pools||[]).map(p=>p.cap?meter(`Agent pool (${esc(p.user)})`,100*(p.used??0)/p.cap,
+      `${p.used!=null?p.used.toFixed(1):"?"} of ${p.cap} CPUs · ${p.agents} agent${p.agents===1?"":"s"} · ${gb(p.mem)}${p.mem_cap?` of ${gb(p.mem_cap)}`:""}`,null,75,95):"").join("")}
     ${busy!=null?meter("Actually busy",100*busy/m.cpus,`${busy.toFixed(1)} of ${m.cpus} · load ${m.load[0].toFixed(1)}`,null,75,95):""}</div>
   <div class="card"><div class="top"><span class="name">Memory</span><span class="meta">not reserved by jobs; caps only</span></div>
     ${meter("In use",100*m.mem_used/m.mem_total,`${gb(m.mem_used)} of ${gb(m.mem_total)}`,null,70,90)}</div>`}
@@ -152,6 +157,18 @@ Each worker uses about ${e.rate.toFixed(2)}% of the week per hour; ${(e.stop-e.u
 Based on ${e.basis}. Your own use of the plan counts too.`+(extra?"\n"+extra:"");
   return`<div class="fit"><span>Workers that fit: <b class="${max<n?"bad":""}">${max}</b> · ${n} running${tip(why)}</span>
     <span>${out?`Runs out <b class="bad">${when(now+e.hours_at_now*3600)}</b>${tip(`At the current pace (${n} workers), the allowance runs out ${dur(e.hours_at_now)} from now, ${dur(e.hours_left-e.hours_at_now)} before it renews.`)}`:`Lasts until it renews${tip("At the current pace the allowance lasts until "+when(renew)+".")}`}</span></div>`}
+function creditsHTML(k){
+  if(!k)return"";const usd=v=>"$"+(+v).toLocaleString(undefined,{maximumFractionDigits:v<100?2:0});
+  const mode={on:"on: the lab goes on past the plan",off:"off: the lab stops at the plan",paused:"paused: a run ran out of credits; Claude waits 6 h"}[k.mode]||k.mode;
+  const by=Object.entries(k.by_project_day||{}).sort((a,b)=>b[1]-a[1]).map(([p,v])=>`${esc(p)} ${usd(v)}`).join(" · ");
+  const rate=k.week/7,left=k.estimate!=null&&rate>0?Math.max(0,k.estimate)/Math.max(rate,k.day):null;
+  const used=k.reported?100*Math.min(1,Math.max(0,k.reported-k.estimate)/k.reported):0;
+  return `${k.reported!=null?meter("Claude credits",used,usd(Math.max(0,k.estimate))+" left of "+usd(k.reported)+" · credits "+esc(k.mode),null,75,90):""}
+    <div class="tok" style="margin-top:8px"><b>Credits</b> ${esc(mode)}</div>
+    <div class="tok">Lab's spend from credits: ${usd(k.day)} last 24 h · ${usd(k.week)} last 7 days</div>
+    ${by?`<div class="tok">From credits, last 24 h: ${by}</div>`:""}
+    ${k.reported!=null?`<div class="tok">Balance: ${usd(k.reported)} reported ${ago(k.reported_at)}${k.reported_note?" ("+esc(k.reported_note)+")":""}; the lab has spent ${usd(k.spent_since)} since, so about <b>${usd(Math.max(0,k.estimate))}</b> left${left!=null?`, ~${left<2?Math.round(left*24)+" h":Math.round(left)+" days"} at the current rate`:""}.</div>`:`<div class="tok q">Balance unknown: claude.ai's balance can't be read from agentbox. Tell the director what Settings › Usage shows.</div>`}
+    <div class="tok q">Counts the lab's runs made while the plan was used up (5-hour or weekly limit at 100%), at API prices; tracked since ${ago(k.tracked_since)}. Your own use and the director chat also draw on the balance.</div>`}
 function usageHTML(u){
   const c=u.codex||{},cl=u.claude||{},p=cl.plan||{},e=u.hpc||{};let out="";
   let cx="";(c.windows||[]).forEach(w=>{const d=w.window_minutes>=10080?"Week":w.window_minutes>=300?Math.round(w.window_minutes/60)+"-hour window":w.window_minutes+"-min window";
@@ -159,13 +176,17 @@ function usageHTML(u){
       Math.min(100,(w.elapsed_percent||0)+15),95,"time elapsed: staying left of this mark keeps pace")});
   const t=Object.entries(c.tokens_24h||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${esc(k)} ${fmt(v)}`).join(" · ");
   out+=`<div class="card"><div class="top"><span class="name">Codex</span>${pill("Codex")}${c.credits!=null?`<span class="meta">${Math.round(+c.credits).toLocaleString()} credits</span>`:""}</div>${cx||'<div class="meta">No plan data.</div>'}
-    ${t?`<div class="tok">Tokens, last 24 h: ${t}</div>`:""}${fitHTML(EST.codex,"")}</div>`;
+    ${t?`<div class="tok">Tokens, last 24 h: ${t}</div>`:""}${c.api&&c.api.budget?meter("OpenAI API credits",c.api.budget?100*c.api.spent/c.api.budget:0,"$"+(+c.api.spent).toLocaleString(undefined,{maximumFractionDigits:0})+" of $"+(+c.api.budget).toLocaleString()+" spent · overflow "+esc(c.api.overflow),null,75,90):""}${fitHTML(EST.codex,"")}</div>`;
   const stop=cl.stop_percent??60,runs=cl.lab_runs_7d??0,cap=cl.lab_runs_cap??30;
   out+=`<div class="card"><div class="top"><span class="name">Claude</span>${pill("Claude")}<span class="meta">shared with your own use</span></div>
-    ${p.five_hour?meter("5-hour window",p.five_hour.used_percentage,until(p.five_hour.resets_at),null,70,90):""}
     ${p.seven_day?meter("Week",p.seven_day.used_percentage,"lab stops at "+stop+"% · "+until(p.seven_day.resets_at),stop,stop*0.6,stop,"the lab stops using Claude here"):""}
-    ${meter("Lab runs this week",cap?100*runs/cap:0,runs+" of "+cap,null,66,90)}${fitHTML(EST.claude,`The lab's weekly cap leaves ${Math.max(0,cap-runs)} Claude runs.`)}</div>`;
-  let ex=meter("Lab this month",e.lab_budget?100*e.lab_sus/e.lab_budget:0,fmt(e.lab_sus||0)+" of "+fmt(e.lab_budget||0)+" SUs",null,75,90);
+    ${meter("Lab runs this week",cap?100*runs/cap:0,runs+" of "+cap,null,66,90)}${fitHTML(EST.claude,`The lab's weekly cap leaves ${Math.max(0,cap-runs)} Claude runs.`)}${creditsHTML(cl.credits)}</div>`;
+  const al=e.allocation;
+  let ex=al&&al.text?`<div class="tok"><b>Allocation</b> (the center's report, ${ago(al.as_of)})</div><pre class="tok" style="white-space:pre-wrap;overflow-x:auto;margin:4px 0 8px">${esc(al.text)}</pre>`:"";
+  const sc=e.scratch,tb=kb=>(kb/2**30).toFixed(kb<2**30?2:1)+" TB";
+  if(sc&&sc.group&&sc.group_limit_kb)ex+=meter("Scratch, group "+esc(sc.group),100*sc.group_used_kb/sc.group_limit_kb,tb(sc.group_used_kb)+" of "+tb(sc.group_limit_kb)+(sc.user?" · "+esc(sc.user)+" "+tb(sc.user_used_kb):"")+" · "+ago(sc.time),null,90,94);
+  else if(sc&&sc.user&&sc.user_limit_kb)ex+=meter("Scratch, "+esc(sc.user),100*sc.user_used_kb/sc.user_limit_kb,tb(sc.user_used_kb)+" of "+tb(sc.user_limit_kb)+" · "+ago(sc.time),null,90,94);
+  ex+=meter("Lab this month",e.lab_budget?100*e.lab_sus/e.lab_budget:0,fmt(e.lab_sus||0)+" of "+fmt(e.lab_budget||0)+" SUs",null,75,90);
   Object.entries(e.by_project||{}).forEach(([k,v])=>{ex+=meter(k,v.budget?100*v.sus/v.budget:0,fmt(v.sus)+" of "+fmt(v.budget)+" SUs",null,75,90)});
   out+=`<div class="card"><div class="top"><span class="name">HPC</span><span class="meta">${e.connected?"connected":"not connected"}${e.held_jobs?" · "+e.held_jobs+" held for you":""}</span></div>${ex}</div>`;
   out+=machineHTML(MACHINE);
