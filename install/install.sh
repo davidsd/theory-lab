@@ -92,11 +92,9 @@ if [[ $second == yes ]]; then
   # The dashboard (run by hpc) shows a running Claude agent's latest message from its live transcript, which
   # the agent account writes in its own home: let hpc read just that folder. (The accounts are one trust
   # domain anyway; README, "Security model and limits".)
-  t=/home/agent/.claude/projects
-  [[ ! -L /home/agent/.claude && ! -L $t ]] || die "$t is or goes through a symlink; refusing."
-  install -d -o agent -g agent -m 700 /home/agent/.claude "$t"
-  setfacl -m u:hpc:x /home/agent /home/agent/.claude
-  setfacl -P -R -m u:hpc:rX -m d:u:hpc:rX "$t"
+  # Done as agent, not root: the folder is agent's, so a link planted there must not steer a root chown/setfacl.
+  sudo -u agent -H bash -c 'install -d -m 700 ~/.claude ~/.claude/projects && setfacl -m u:hpc:x ~ ~/.claude &&
+    setfacl -P -R -m u:hpc:rX -m d:u:hpc:rX ~/.claude/projects'
 fi
 
 step "Folders"
@@ -264,7 +262,10 @@ add_cron '*/10 * * * * /usr/local/bin/lab-reset-watch >> /srv/lab/state/logs/res
 if [[ $slack == yes ]]; then
   add_cron '*/10 * * * * /usr/local/bin/lab-slack sync >> /srv/lab/state/slack/sync.log 2>&1'
   add_cron '*/5 * * * * flock -n /srv/lab/state/slack/listen.lock /usr/local/bin/lab-slack-listen >> /srv/lab/state/slack/listen.log 2>&1'
-  lab_dir hpc agents 2770 /srv/lab/state/slack
+  # Only hpc's sync and listener write lab-slack's state (approved posts, offers, replay queue); the agent account
+  # only queues requests in outbox/ (sticky: it can't remove or rename what hpc keeps there).
+  lab_dir hpc agents 2750 /srv/lab/state/slack
+  lab_dir hpc agents 3770 /srv/lab/state/slack/outbox
   sudo -u hpc -H bash -c '[[ -x ~/opt/slack-venv/bin/python ]] || { python3 -m venv ~/opt/slack-venv && ~/opt/slack-venv/bin/pip install -q slack_sdk; }'
 fi
 printf '%s\n' "$cron" | sed '/^$/d' | crontab -u hpc -
