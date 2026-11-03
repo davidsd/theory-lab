@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""lab-settings-apply (root, from lab-settings.timer): apply settings changes the PI approves on GitHub.
+
+The PI can't sudo from a phone. So the lab proposes a change in /etc/agentbox/lab.conf as a comment on the settings
+issue (lab-settings-propose); the PI replies `approve P<n>` (or `approve` when only one proposal is open), or
+`cancel P<n>`. This script, run as root every few minutes, applies a proposal only if:
+  - the approval was written by the PI's own GitHub account (PI_GITHUB in lab.conf), after the proposal;
+  - the proposal's comment was never edited (the lab's account could otherwise change TO under an approval);
+  - the key is in /etc/agentbox/settings-max.conf and the new value is a whole number from 0 to that maximum;
+  - lab.conf still holds the proposal's FROM value (so a stale proposal can't overwrite a newer change).
+It reads GitHub with a read-only token in /etc/agentbox/settings-gh-token (root only), never anything the lab's accounts
+can write, and records results in /var/lib/lab-settings/ (the watchdog posts them back on the issue).
+"""
+import json, os, re, sys, tempfile, time, urllib.request
+
+CONF = "/etc/agentbox/lab.conf"
+MAXF = "/etc/agentbox/settings-max.conf"
+TOKEN = "/etc/agentbox/settings-gh-token"
+STATE_DIR = "/var/lib/lab-settings"
+STATE = f"{STATE_DIR}/state.json"
+RESULTS = f"{STATE_DIR}/results.jsonl"
+ISSUE_FILE = "/etc/agentbox/settings-issue"   # "<owner>/<repo> <number>", written by the installer
+PROPOSAL = re.compile(r"<!--\s*lab-setting\s+P(\d+)\s+KEY=([A-Z][A-Z0-9_]*)\s+FROM=([0-9]*)\s+TO=([0-9]+)\s*-->")
+VERB = re.compile(r"^\s*(approve|approved|cancel)\b(?:\s+P?(\d+))?\s*[.!]?\s*$", re.I)
+
+
+def conf_values():
+    vals = {}
+    for line in open(CONF):
+        m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=([^\s#]*)", line)
+        if m:
+            vals[m[1]] = m[2]
+    return vals
+
+
+def maxima():
+    out = {}
+    for line in open(MAXF):
+        line = line.split("#", 1)[0].strip()
+        m = re.fullmatch(r"([A-Z_][A-Z0-9_]*)\s+([0-9]+)", line)
+        if m:
+            out[m[1]] = int(m[2])
+    return out
+
+
+def gh_comments(repo, num, token):
+    out, page = [], 1
+    while True:
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/issues/{num}/comments?per_page=100&page={page}",
+                                     headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                              "User-Agent": "lab-settings-apply"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            batch = json.load(r)
+        out += batch
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+def set_conf(key, value):
+    lines = open(CONF).read().splitlines(keepends=True)
+    done = False
+    for i, line in enumerate(lines):
+        m = re.match(r"(\s*)" + key + r"=[^\s#]*(.*?)(\n?)$", line, re.S)
+        if m and not done:
+            lines[i] = f"{m[1]}{key}={value}{m[2]}{m[3]}"
+            done = True
+    if not done:
+        lines.append(f"{key}={value}   # set by lab-settings-apply on the PI's approval\n")
+    st = os.stat(CONF)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONF))
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(lines))
+    os.chmod(tmp, st.st_mode & 0o777)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, CONF)
+
+
+def decide(comments, pi, done, maxima, conf):
+    """The pure part: from the issue's comments (GitHub REST objects), the PI's login, the proposals already
+    decided (P number -> result, updated in place), the hard maxima and lab.conf's values, return the list of
+    (pid, key, frm, to, result, approval url) decided now. A result "applied" means: set key to `to`."""
+    proposals = {}                             # P number -> (comment, key, from, to); first claim wins
+    out, conf = [], dict(conf)
+    for c in sorted(comments, key=lambda c: c["created_at"]):
+        for m in PROPOSAL.finditer(c["body"] or ""):
+            if c.get("updated_at", c["created_at"]) != c["created_at"]:
+                done.setdefault(m[1], "refused: the proposal was edited after it was posted; propose again")
+            proposals.setdefault(m[1], (c, m[2], m[3], m[4]))
+        if not pi or (c.get("user") or {}).get("login") != pi:
+            continue
+        v = VERB.match(c["body"] or "")
+        if not v:
+            continue
+        verb, pid = v[1].lower(), v[2]
+        if not pid:   # a bare approve/cancel: the one open proposal posted before it
+            open_ids = [p for p, (pc, *_) in proposals.items() if p not in done and pc["created_at"] < c["created_at"]]
+            if len(open_ids) != 1:
+                continue
+            pid = open_ids[0]
+        if pid in done or pid not in proposals or proposals[pid][0]["created_at"] > c["created_at"]:
+            continue
+        _, key, frm, to = proposals[pid]
+        if verb == "cancel":
+            done[pid] = "cancelled"
+        else:
+            cur = conf.get(key, "")
+            if key not in maxima:
+                done[pid] = f"refused: {key} is not a key the PI can change this way"
+            elif int(to) > maxima[key]:
+                done[pid] = f"refused: {to} is above the hard maximum {maxima[key]} for {key}"
+            elif cur != frm:
+                done[pid] = f"refused: lab.conf has {key}={cur or '(unset)'}, not {frm or '(unset)'}; propose again"
+            else:
+                done[pid] = "applied"
+                conf[key] = to
+        out.append((pid, key, frm, to, done[pid], c["html_url"]))
+    return out
+
+
+def main():
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    repo, num = open(ISSUE_FILE).read().split()
+    token = open(TOKEN).read().strip()
+    pi = conf_values().get("PI_GITHUB", "")
+    if not pi or "CHANGE-ME" in pi:
+        sys.exit("lab-settings-apply: set PI_GITHUB in lab.conf first.")
+    state = json.load(open(STATE)) if os.path.exists(STATE) else {"done": {}}
+    done = state["done"]                       # "P<n>" -> "applied" | "cancelled" | "refused: ..."
+    results = []
+    for pid, key, frm, to, result, url in decide(gh_comments(repo, num, token), pi, done, maxima(), conf_values()):
+        if result == "applied":
+            set_conf(key, to)
+        results.append(dict(time=int(time.time()), proposal=f"P{pid}", key=key, frm=frm, to=to, result=result,
+                            approval=url))
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE)
+    if results:
+        with open(RESULTS, "a") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+        os.chmod(RESULTS, 0o644)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("lab-settings-apply runs as root.")
+    main()

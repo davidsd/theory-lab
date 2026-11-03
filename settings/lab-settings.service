@@ -1,0 +1,7 @@
+[Unit]
+Description=Apply lab settings changes the PI approved on GitHub
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lab-settings-apply
