@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# lab-reset-watch: notice when the Codex or Claude weekly window resets, including early or moved resets
+# (providers sometimes reset plans early; a lab that keeps pacing itself to the old window wastes the new one).
+# Run from hpc's crontab every 10 minutes, and by the director at the start of its passes. It reads
+# state/usage/summary.json (refreshing it when older than 20 minutes), compares each window's reset time and
+# usage with the last reading, and on a reset appends a line to state/usage/resets.log and to the director's
+# inbox file state/director-attention.md, which the director reads at the start of every pass. Once per window,
+# when a window resets within 24 h with allowance left, it also asks the director to offer the PI to use it up.
+set -uo pipefail
+export PATH="/usr/local/bin:$PATH"   # from cron, whose PATH lacks it (lab, gh)
+LAB=${LAB_DIR:-/srv/lab}
+U=$LAB/state/usage
+S=$U/summary.json
+W=$U/reset-watch.json
+now=$(date +%s)
+if [[ ! -f $S ]] || (( now - $(stat -c %Y "$S") > 1200 )); then
+  lab usage --refresh > /dev/null 2>&1 || true
+fi
+[[ -f $S ]] || exit 0
+
+read -r cx_reset cx_used < <(jq -r '[([.codex.windows[]?.resets_at] | max // 0), ([.codex.windows[]?.used_percent] | max // 0)] | @tsv' "$S")
+read -r cl_reset cl_used < <(jq -r '[(.claude.plan.seven_day.resets_at // 0), (.claude.plan.seven_day.used_percentage // 0)] | @tsv' "$S")
+
+if [[ -f $W ]]; then
+  read -r o_cx_reset o_cx_used o_cl_reset o_cl_used < <(jq -r '[.cx_reset, .cx_used, .cl_reset, .cl_used] | @tsv' "$W")
+  event() {  # event <model> <old reset> <new reset> <old used> <new used>
+    local line
+    line="$(date '+%F %H:%M %Z'): $1 weekly window reset: was ${4}% used (reset due $(date -d @"$2" '+%a %b %d %H:%M %Z')), now ${5}% used, next reset $(date -d @"$3" '+%a %b %d %H:%M %Z')."
+    echo "$line" >> "$U/resets.log"
+    printf -- '- %s Re-plan model use (LAB-RULES "Finite resources") and tell the PI in the next report.\n' "$line" \
+      >> "$LAB/state/director-attention.md"
+  }
+  # A reset: the reset time moved forward by more than a day, or usage fell by more than 20 points.
+  if (( cx_reset > 0 && o_cx_reset > 0 )) && { (( cx_reset - o_cx_reset > 86400 )) || awk -v a="$o_cx_used" -v b="$cx_used" 'BEGIN{exit !(a - b > 20)}'; }; then
+    event Codex "$o_cx_reset" "$cx_reset" "$o_cx_used" "$cx_used"
+  fi
+  if (( cl_reset > 0 && o_cl_reset > 0 )) && { (( cl_reset - o_cl_reset > 86400 )) || awk -v a="$o_cl_used" -v b="$cl_used" 'BEGIN{exit !(a - b > 20)}'; }; then
+    event Claude "$o_cl_reset" "$cl_reset" "$o_cl_used" "$cl_used"
+  fi
+fi
+# Near a reset with allowance left: once per window, when it resets within 24 h, tell the director, who offers
+# the PI the choice of using up the rest (Claude: `lab set CLAUDE_LAB_STOP_PERCENT <n>`; Codex: more agents).
+near() {  # near <model> <reset> <used> <stop or "">
+  local flag=$U/near-reset-$1-$2 left
+  (( $2 > now && $2 - now < 86400 )) || return 0
+  [[ -e $flag ]] && return 0
+  left=$(awk -v u="$3" -v s="${4:-100}" 'BEGIN{printf "%d", s - u}')
+  (( left >= 10 )) || return 0
+  touch "$flag"
+  printf -- '- %s: %s weekly window resets %s with %s%% used%s. Ask the PI whether to use up the rest before it resets.\n' \
+    "$(date '+%F %H:%M %Z')" "$1" "$(date -d @"$2" '+%a %b %d %H:%M %Z')" "$3" \
+    "${4:+ (the lab stops at $4%; raise it with lab set CLAUDE_LAB_STOP_PERCENT <n>)}" >> "$LAB/state/director-attention.md"
+}
+source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh" 2> /dev/null && load_conf 2> /dev/null
+(( cl_reset > 0 )) && near Claude "$cl_reset" "$cl_used" "${CLAUDE_LAB_STOP_PERCENT:-80}"
+(( cx_reset > 0 )) && near Codex "$cx_reset" "$cx_used" ""
+find "$U" -maxdepth 1 -name 'near-reset-*' -mtime +10 -delete 2> /dev/null
+
+# Keep the last nonzero readings (a missing reading must not look like a reset next time).
+jq -n --argjson a "${cx_reset:-0}" --argjson b "${cx_used:-0}" --argjson c "${cl_reset:-0}" --argjson d "${cl_used:-0}" \
+  --slurpfile old <( [[ -f $W ]] && cat "$W" || echo '{}' ) \
+  '($old[0] // {}) as $o | {cx_reset: (if $a > 0 then $a else ($o.cx_reset // 0) end), cx_used: (if $a > 0 then $b else ($o.cx_used // 0) end),
+     cl_reset: (if $c > 0 then $c else ($o.cl_reset // 0) end), cl_used: (if $c > 0 then $d else ($o.cl_used // 0) end)}' > "$W.new" && mv "$W.new" "$W"

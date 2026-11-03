@@ -3,12 +3,13 @@
 #   lab-cancel --project <p> --issue <n> --reason "<why>" [--agent] <job>...
 # Cancels a job only if it belongs to <p>: named lab:<p>:... or run from a folder under /srv/projects/<p>/.
 # A job that is itself an agent (lab:<p>:<role>:<issue>) needs --agent, so stopping an agent is deliberate:
-# only a lead stopping one of its project's agents uses it. Logs every cancel to /srv/lab/state/cancels.tsv.
+# only a lead stopping one of its project's agents uses it. Agents outside Slurm have ids a1, a2, ... and
+# are stopped the same way (their service, through `lab _stop-agent`). Logs every cancel to /srv/lab/state/cancels.tsv.
 set -uo pipefail
 source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
 
 usage() {
-  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -29,6 +30,22 @@ done
 log=$LAB/state/cancels.tsv
 failed=0
 for job in "$@"; do
+  if [[ $job =~ ^a[0-9]+$ ]]; then   # an agent outside Slurm (AGENT_RUNNER=systemd): stop its service
+    f=$LAB/state/agents/$job.json
+    [[ -f $f ]] || { echo "Agent $job is not running." >&2; failed=1; continue; }
+    name=$(jq -r .name "$f")
+    [[ $name == "lab:$project:"* ]] || { echo "Refusing agent $job ($name): not a $project agent." >&2; failed=1; continue; }
+    (( agent )) || { echo "Refusing agent $job ($name): it is an agent. Only a lead stops one, with --agent." >&2; failed=1; continue; }
+    owner=$(project_field "$project" account)
+    if [[ $owner == "$(id -un)" ]]; then stop=(lab _stop-agent "$job"); else stop=(sudo -n -H -u "$owner" lab _stop-agent "$job"); fi
+    if out=$("${stop[@]}" 2>&1); then
+      echo "Stopping agent $job ($name); it says on its issue how it ended."
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(now)" "$project" "$issue" "agentbox:$job $name" "${reason//[$'\t\n']/ }" >> "$log"
+    else
+      echo "Stopping agent $job failed: $out" >&2; failed=1
+    fi
+    continue
+  fi
   [[ $job =~ ^[0-9]+(_[0-9]+)?$ ]] || { echo "Skipping '$job': not a job id." >&2; failed=1; continue; }
   line=$(squeue -h -j "$job" -o '%j|%Z' 2>/dev/null | head -1)
   [[ -n $line ]] || { echo "Job $job is not in the queue." >&2; failed=1; continue; }

@@ -1,0 +1,17 @@
+# Keys of /etc/agentbox/lab.conf that the PI can change by approving a lab proposal on GitHub (lab-settings-apply),
+# with the hard maximum for each. Installed as /etc/agentbox/settings-max.conf (root-owned, readable by all, since
+# lab-settings-propose checks it too); edit it with sudo to change the list. A key not listed here can't be
+# changed this way; a value above its maximum is refused.
+# The numbers below are examples: set maxima you would be comfortable approving by mistake from your phone,
+# e.g. about three times the values you use now.
+#
+# <KEY>                         <hard maximum>
+HPC_AUTO_SUS_PER_JOB            6000      # HPC jobs up to this many SUs start without asking the PI
+HPC_AUTO_SUS_PER_DAY            30000     # rolling 24-h auto-release limit for the lab
+HPC_LAB_SUS_PER_MONTH           150000    # the lab's share of the allocation per month
+CLAUDE_LAB_STOP_PERCENT_MAX     100       # ceiling for `lab set CLAUDE_LAB_STOP_PERCENT`
+CLAUDE_LAB_RUNS_PER_WEEK_MAX    300
+CODEX_CREDITS_PER_WINDOW_MAX    0         # raise if you buy Codex credits for the lab
+CODEX_API_BUDGET_USD_MAX        0         # raise if you give the lab an OpenAI API budget
+AGENT_POOL_CPUS_MAX             8         # at most the machine's CPUs
+AGENT_POOL_MEM_GB_MAX           32        # leave memory for Slurm jobs and the system

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""lab-arxiv: today's new arXiv papers in the lab's fields, sorted for the director's daily check.
+
+Fetches arXiv's RSS for the categories in /srv/lab/arxiv-topics.json (new submissions and cross-lists, not
+replacements), skips papers seen on earlier days, and writes /srv/lab/state/arxiv/<date>.md:
+  1. papers matching a project's keywords, with their abstracts and which projects matched;
+  2. every other new paper, title only, so the director can still spot a relevant one the keywords missed.
+Prints the file's path. Seen ids are kept in state/arxiv/seen.txt. arXiv announces Sunday-Thursday nights
+(US Eastern); on days without an announcement the file says so.
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+
+LAB = os.environ.get("LAB_DIR", "/srv/lab")
+cfg = json.load(open(f"{LAB}/arxiv-topics.json"))
+outdir = f"{LAB}/state/arxiv"
+os.makedirs(outdir, exist_ok=True)
+seen_path = f"{outdir}/seen.txt"
+seen = set(open(seen_path).read().split()) if os.path.exists(seen_path) else set()
+
+url = "https://rss.arxiv.org/rss/" + "+".join(cfg["categories"])
+for attempt in range(3):
+    try:
+        data = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "lab-arxiv (research lab digest)"}),
+                                      timeout=60).read()
+        break
+    except Exception as e:  # arXiv asks for gentle use: three tries, a minute apart
+        if attempt == 2:
+            sys.exit(f"lab-arxiv: can't fetch {url}: {e}")
+        time.sleep(60)
+root = ET.fromstring(data)
+ns = {"dc": "http://purl.org/dc/elements/1.1/", "arxiv": "http://arxiv.org/schemas/atom"}
+items = []
+for it in root.iter("item"):
+    link = it.findtext("link") or ""
+    aid = link.rsplit("/", 1)[-1]
+    desc = it.findtext("description") or ""
+    m = re.search(r"Announce Type:\s*(\S+)", desc)
+    kind = m.group(1) if m else "?"
+    if kind not in ("new", "cross") or not aid or aid in seen:
+        continue
+    abstract = desc.split("Abstract:", 1)[-1].strip()
+    cats = [c.text for c in it.findall("category") if c.text]
+    items.append(dict(id=aid, title=" ".join((it.findtext("title") or "").split()), link=link, kind=kind, cats=cats,
+                      authors=" ".join((it.findtext("dc:creator", namespaces=ns) or "").split()), abstract=" ".join(abstract.split())))
+
+today = time.strftime("%Y-%m-%d")
+path = f"{outdir}/{today}.md"
+hits, rest = [], []
+for p in items:
+    text = (p["title"] + " " + p["abstract"]).lower()
+    matched = {proj: [k for k in kws if k in text] for proj, kws in cfg["projects"].items()}
+    matched = {k: v for k, v in matched.items() if v}
+    strong = [k for k in cfg.get("strong", []) if k in text]
+    score = sum(len(v) for v in matched.values()) + 3 * len(strong)
+    (hits if matched else rest).append((score, p, matched))
+hits.sort(key=lambda x: -x[0])
+with open(path, "w") as f:
+    f.write(f"# arXiv check, {today}\n\nFrom {url} ({len(items)} new or cross-listed papers not seen before; "
+            f"{len(hits)} match a project's keywords).\n\n")
+    if not items:
+        f.write("No new announcement today (arXiv doesn't announce on Friday and Saturday nights, US Eastern).\n")
+    f.write("## Keyword matches (highest first)\n\n")
+    for score, p, matched in hits:
+        f.write(f"### [{p['id']}]({p['link']}) {p['title']}\n{p['authors']} · {', '.join(p['cats'])} · {p['kind']}\n"
+                f"Matches: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in matched.items()) + f"\n\n{p['abstract']}\n\n")
+    f.write("## Other new papers (titles)\n\n")
+    for _, p, _ in rest:
+        f.write(f"- [{p['id']}]({p['link']}) {p['title']} ({', '.join(p['cats'][:3])})\n")
+with open(seen_path, "a") as f:
+    for p in items:
+        f.write(p["id"] + "\n")
+print(path)

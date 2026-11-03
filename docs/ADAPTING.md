@@ -12,9 +12,10 @@ scripts named here. Keep the invariants in the last section whatever you change.
 | Private network | Tailscale: SETUP.md step 2, `dashboard/serve.py` (`tailscale ip -4`, listens there) |
 | Code host and board | GitHub via `gh`: `bin/lab` (repo create/clone/archive, labels, issues), `share/lib.sh` (`ensure_labels`, `pi_decision`, `agents_login`), `bin/watchdog`, `bin/lab-worker`, `hpc/hpc-submit`, `slack/*`, all role files (`gh issue ...`) |
 | AI agents | `share/lib.sh` `run_agent` and `agent_flags`, `templates/lab/models.conf`, `bin/lab-worker` (interactive Codex in tmux, transcript paths), `bin/lab-usage` (reads rate-limit records from Codex rollouts and Claude's status line), `bin/claude-statusline`, `bin/agent-status-hook`, `share/config/*` |
-| Local scheduler | Slurm: `bin/lab` (`sbatch`, `squeue`, `scancel`, `sinfo`), `bin/lab-worker` (signals), `bin/lab-cancel`, `install/install.sh` |
+| Local scheduler | Slurm (with slurmdbd accounting) for computations: `bin/lab-run`, `bin/lab` (`sbatch`, `squeue`, `scancel`, `sinfo`), `bin/lab-cancel`, `install/install.sh`; systemd user services for the agents themselves: `share/lib.sh` (`lab_agents`, `agent_pool`, `new_agent_id`), `bin/lab` (`systemd-run --user`), `bin/lab-worker`, `dashboard/serve.py` (cgroups) |
 | Cluster | `hpc/*`, `bin/lab-usage` (`sacct`), `bin/lab-rm` (`hpc:` paths), lab.conf `HPC_*` |
 | Notifications | ntfy: `share/lib.sh` `notify` (one `curl` POST) |
+| Root settings from a phone | `settings/lab-settings-apply` (GitHub REST with a read-only token), `bin/lab-settings-propose`, `bin/watchdog` (posts results) |
 | Chat | Slack: `slack/lab-slack` (sync, post, outbox), `slack/lab-slack-listen` (Socket Mode responder) |
 
 ## Another cloud
@@ -52,21 +53,27 @@ shell commands without asking (inside the Unix account as its sandbox) fits. Add
 
 Pacing reads usage windows: `bin/lab-usage` takes Codex's from its session records (`rate_limits` in
 `~/.codex/sessions/**/rollout-*.jsonl`) and Claude's from what Claude Code hands its status line
-(`bin/claude-statusline` saves it). For an API-key setup, replace these with spend: sum token counts from
-the run logs (`record_run` already records input, cached input and output tokens per run in
-`state/usage/<model>-runs.tsv`), multiply by prices, and set a weekly dollar budget; then make
-`codex_pressure`/`claude_room` compare spend with budget.
+(`bin/claude-statusline` saves it). Spend-based pacing already exists for Codex on the OpenAI API
+(`CODEX_API`, `CODEX_API_BUDGET_USD`): `record_api_run` prices each API run from `codex-api-prices.tsv` into
+`state/usage/codex-api-runs.tsv`, and `codex_api_room` compares the total with the budget. For an API-only
+setup, make `codex_pressure` return `api` always (or mark every run with `LAB_CODEX_API`), and do the same for
+Claude in `claude_room` (Claude's `-p` result already reports `total_cost_usd`; the dashboard sums it).
 
 `bin/lab-worker` runs Codex workers interactively in a tmux session inside the Slurm job so the PI can
 type to them (`talk`); other CLIs may run non-interactively there instead (Claude workers already do).
 
 ## Another local scheduler, or none
 
-Slurm here does two jobs: it keeps the machine from being overloaded (every agent and every sizable run is
-a job with CPUs and memory), and it names jobs `lab:<project>:<role>:<issue>` so the lab can count and
-cancel them. Any queue with names, CPU limits and cancel works (e.g. systemd-run with slices, or a small
-queue of your own); replace `sbatch/squeue/scancel/sinfo` in `bin/lab`, `bin/lab-worker` (it traps
-`USR1` five minutes before the time limit and `TERM` on cancel), `bin/lab-cancel` and the dashboard.
+Two mechanisms share the machine. The agents themselves (`AGENT_RUNNER=systemd`) are systemd user services
+in one capped slice per account (`lab-agents.slice`, `AGENT_POOL_CPUS`/`AGENT_POOL_MEM_GB`); each registers
+in `state/agents/a<N>.json`, and counts as alive only while its pid's cgroup names its own unit, so a reused
+pid or a forged file doesn't count. Their computations go to Slurm, which keeps the machine from being
+overloaded and names jobs `lab:<project>:...` so the lab can count and cancel them (`lab-run` jobs are
+`lab:<project>:run:<issue>:<agent>`, cancelled when the agent ends). Slurm needs accounting (slurmdbd), or
+jobs that have to queue are rejected. Without systemd user services, use `AGENT_RUNNER=slurm` (each agent is
+a Slurm job). Without Slurm, any queue with names, CPU limits and cancel works; replace
+`sbatch/srun/salloc/squeue/scancel/sinfo` in `bin/lab`, `bin/lab-run`, `bin/lab-worker` (it traps `USR1` five
+minutes before the time limit and `TERM` on cancel), `bin/lab-cancel` and the dashboard.
 
 ## Another cluster or scheduler on the cluster
 
@@ -92,7 +99,8 @@ token checks them against a config and sends) carries over to Discord, Zulip or 
   tools that use them check requests against a config the agents can't edit.
 - **Limits are root-owned.** lab.conf and the scripts that enforce budgets live where agents can't write.
 - **Only the PI approves.** Approvals are the PI's own unedited comments (or the PI's own Slack user),
-  never text an agent could write.
+  never text an agent could write. Root-applied settings are read with the PI's own read-only token and
+  checked against root-owned maxima.
 - **Scoped destruction.** Agents cancel and delete only through tools that check the project's own jobs and
   folders and log every action.
 - **Files over memory.** Every pass starts fresh from the repo and the board.

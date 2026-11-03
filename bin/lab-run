@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# lab-run: an agent's computations through Slurm, so CPUs are held only while something computes.
+#   lab-run [--cpus N] [--mem M] [--hours H] -- <command> [args]   run one command as a Slurm job; wait for it
+#   lab-run --alloc [--cpus N] [--mem M] [--hours H]               reserve CPUs for many small steps; prints the
+#                                                                   job id; then: srun --jobid=<id> --overlap <command>
+#   lab-run --release <id>                                          end that reservation (do it as soon as you're done)
+#   lab-run --list                                                  this agent's reservations and runs
+# Jobs are named lab:<project>:run:<issue>:<agent>, so lab-cancel and the project's limits see them, and
+# lab-worker cancels any that are left when the agent's session ends. Defaults: 1 CPU, 4G, 1 hour.
+set -euo pipefail
+die() { echo "lab-run: $*" >&2; exit 1; }
+project=${LAB_PROJECT:-} issue=${LAB_ISSUE:-} agent=${LAB_AGENT_ID:-${SLURM_JOB_ID:-}}
+[[ -n $project && -n $issue && -n $agent ]] || die "run this from a lab agent's session (LAB_PROJECT, LAB_ISSUE and LAB_AGENT_ID are unset)."
+name="lab:$project:run:$issue:$agent"
+# A new job, not a step of the caller's own (a worker that is itself a Slurm job).
+for v in "${!SLURM_@}"; do unset "$v"; done
+cpus=1 mem=4G hours=1 mode=run
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --cpus) cpus=$2; shift 2 ;;
+    --mem) mem=$2; shift 2 ;;
+    --hours) hours=$2; shift 2 ;;
+    --alloc) mode=alloc; shift ;;
+    --release) mode=release; rel=${2:-}; shift 2 || die "--release <job id>" ;;
+    --list) mode=list; shift ;;
+    --) shift; break ;;
+    -*) die "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+[[ $cpus =~ ^[0-9]+$ && $hours =~ ^[0-9]+$ ]] || die "--cpus and --hours are whole numbers."
+case $mode in
+  run)
+    [[ $# -gt 0 ]] || die "give a command after --"
+    exec srun --job-name="$name" --ntasks=1 --cpus-per-task="$cpus" --mem="$mem" --time="$hours:00:00" --chdir="$PWD" "$@" ;;
+  alloc)
+    out=$(salloc --no-shell --job-name="$name" --ntasks=1 --cpus-per-task="$cpus" --mem="$mem" --time="$hours:00:00" 2>&1) ||
+      die "salloc failed: $out"
+    id=$(grep -oE 'job allocation [0-9]+' <<< "$out" | grep -oE '[0-9]+' | head -1)
+    [[ -n $id ]] || die "no job id in: $out"
+    echo "$id"
+    echo "Reserved $cpus CPUs as job $id for up to $hours h. Run steps with: srun --jobid=$id --overlap <command>. Release with: lab-run --release $id" >&2 ;;
+  release)
+    [[ $rel =~ ^[0-9]+$ ]] || die "--release <job id>"
+    [[ $(squeue -h -j "$rel" -o %j 2> /dev/null) == "$name" ]] || die "job $rel isn't one of this agent's reservations."
+    scancel "$rel" ;;
+  list)
+    squeue -h -n "$name" -o '%i %T %M %C' ;;
+esac

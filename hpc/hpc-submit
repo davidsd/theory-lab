@@ -4,8 +4,10 @@
 # Submits the job held, estimates its cost in SUs from what Slurm says it will use, and records it in
 # /srv/lab/state/hpc-ledger.tsv. If the job fits the automatic limits in /etc/agentbox/lab.conf
 # (per job, per day, the lab's monthly budget) and the project's monthly budget (`lab budget`), it's
-# released at once. Otherwise it stays held and an inbox issue asks the PI; the watchdog releases or
-# cancels it when they answer. GPU jobs, job arrays and heterogeneous jobs always ask.
+# released at once. A job over only the rolling 24-h limit is queued quietly: it stays held, an issue labeled
+# hpc-queued (not assigned to anyone) says so, and hpc-release-queued releases it once it fits. Otherwise it
+# stays held and an inbox issue asks the PI; the watchdog releases or cancels it when they answer. GPU jobs,
+# job arrays and heterogeneous jobs always ask.
 #
 # Ledger columns: epoch, time, project, issue, job, partition, nodes, CPUs, hours, SUs, status
 # (auto, held, approved, cancelled, gone), reason, approval issue URL.
@@ -13,7 +15,7 @@ set -uo pipefail
 source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
 
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -85,7 +87,27 @@ if [[ ",${HPC_WHOLE_NODE_PARTITIONS:-}," == *",$partition,"* ]]; then
   [[ $HPC_CORES_PER_NODE =~ ^[1-9][0-9]*$ ]] || { echo "Set HPC_CORES_PER_NODE in lab.conf." >&2; exit 1; }
   sus=$(( nodes * HPC_CORES_PER_NODE * hours ))
 else
-  sus=$(( cpus * hours ))
+  # Shared partitions: many centers charge memory too, as CPU-equivalents (HPC_GB_PER_CORE GB = one core; 0:
+  # memory isn't charged). If the center's Slurm reports SUs in its billing TRES (HPC_BILLING_PER_SU units per
+  # SU-hour; 0: don't use it), the larger of the two counts.
+  equiv=$cpus
+  tres=$(grep -oE '(^| )TRES=[^ ]+' <<<"$info" | head -1)
+  gb_per_core=${HPC_GB_PER_CORE:-0} billing_per_su=${HPC_BILLING_PER_SU:-0}
+  if (( gb_per_core > 0 )); then
+    mem=$(grep -oE 'mem=[0-9.]+[KMGT]?' <<<"$tres" | head -1 | cut -d= -f2)
+    mem_mb=$(awk -v m="$mem" 'BEGIN { u = substr(m, length(m)); v = m + 0
+      if (u == "K") v /= 1024; else if (u == "G") v *= 1024; else if (u == "T") v *= 1048576
+      printf "%d", v + 0.999 }')
+    per=$(( gb_per_core * 1024 ))
+    (( (mem_mb + per - 1) / per > equiv )) && equiv=$(( (mem_mb + per - 1) / per ))
+  fi
+  if (( billing_per_su > 0 )); then
+    billing=$(grep -oE 'billing=[0-9]+' <<<"$tres" | head -1 | cut -d= -f2)
+    if [[ -n $billing ]] && (( (billing + billing_per_su - 1) / billing_per_su > equiv )); then
+      equiv=$(( (billing + billing_per_su - 1) / billing_per_su ))
+    fi
+  fi
+  sus=$(( equiv * hours ))
 fi
 
 # Decide and record under one lock, so two submissions can't both squeeze under a limit.
@@ -119,6 +141,20 @@ if [[ -z $why ]]; then
     status=held
     echo "HPC job $job was submitted but couldn't be released; it stays held. Say so in your issue." >&2
   fi
+elif [[ $why == "over the lab's daily limit"* ]]; then
+  # Only the rolling 24-h limit: the job waits, held, and hpc-release-queued (run by the watchdog) releases it
+  # as soon as it fits. No question for the PI: such a job is within the budgets, only early.
+  status=held
+  url=$(timeout 60 gh issue create -R "$ORG/$project" --title "HPC job $job queued for the daily limit (~$sus SUs)" \
+    --label hpc-queued --body "For issue #$issue: $reason
+
+- Command: \`$command\`
+- Partition $partition, $nodes nodes, $cpus CPUs, time limit $hours h: ~$sus SUs
+- Held because $why.
+- It is released automatically as soon as it fits every limit; nobody needs to act. Don't cancel it to resubmit
+  later: that only loses its place. Cancel it only if it is no longer wanted." < /dev/null)
+  echo "HPC job $job is QUEUED: held only by the lab's daily limit ($today SUs released in 24 h); it is released"
+  echo "automatically when it fits${url:+ ($url)}. Don't cancel and resubmit it; carry on with other work."
 else
   status=held
   url=$(timeout 60 gh issue create -R "$ORG/$project" --title "HPC job $job needs approval (~$sus SUs)" \

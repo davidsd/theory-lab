@@ -15,9 +15,17 @@
 #   lab limit <project> <n>             how many jobs the project may run at once
 #   lab budget <project> <SUs>          the project's monthly HPC budget (0: none of its own)
 #   lab usage [--refresh]               Codex, Claude and HPC use against limits and budgets
-#   lab spawn <project> worker|explorer|verifier --issue <n> [--model codex|claude] [--effort <level>]
+#   lab set [<KEY> <value>|- --reason "<why>"]
+#                                       working limits and model policy (limits.conf), within lab.conf's
+#                                       ceilings; no arguments: show every value, its source and ceiling
+#   lab model <project>|director|default claude|codex [--reason "<why>"]
+#                                       which model a project's lead, the director, or new agents use
+#   lab spawn <project> worker|explorer|verifier --issue <n> [--model codex|claude] [--effort <level>] [--api "<why>"]
+#             (without --model: DEFAULT_MODEL, see lab set)
 #             [--cpus <n>] [--mem <size>] [--hours <n>]
-#                                       start an agent on one issue, as a Slurm job on this machine
+#                                       start an agent on one issue: a user service in the agents' pool
+#                                       (AGENT_RUNNER=systemd) or a Slurm job (AGENT_RUNNER=slurm); --api puts
+#                                       a chosen Codex task on the OpenAI API (CODEX_API_BUDGET_USD)
 #   lab chat <project>|lab [codex|claude]
 #                                       talk about a project, or with the director about the whole lab
 #                                       ("lab"), in a new tmux window
@@ -30,7 +38,7 @@ set -euo pipefail
 source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -111,8 +119,8 @@ cmd_up() {
     ensure_window dashboard 'dashboard/serve.py' "python3 $LAB/dashboard/serve.py --port 8765"
   fi
   local project
-  for project in $(projects_where account "$(id -un)"); do
-    [[ $(project_field "$project" status) == active ]] && ensure_window "lead-$project" "lab-loop lead $project\$" "lab-loop lead $project"
+  for project in $(projects_where account "$(id -un)"); do   # paused projects' loops run watch passes
+    [[ $(project_field "$project" status) =~ ^(active|paused)$ ]] && ensure_window "lead-$project" "lab-loop lead $project\$" "lab-loop lead $project"
   done
   if [[ $(id -un) == hpc ]] && id agent &> /dev/null; then   # the second account is optional
     sudo -n -H -u agent "$0" up
@@ -270,7 +278,7 @@ cmd__start_lead() {
 cmd_pause() {
   need_project "${1:-}"
   registry_update '.projects[$p].status = "paused"' --arg p "$1"
-  echo "Project $1 is paused: its lead stops at its next check; running jobs finish."
+  echo "Project $1 is paused: its lead stops working at its next check (it still looks in every 72 h if something changed); running jobs finish."
 }
 
 cmd_resume() {
@@ -297,9 +305,19 @@ cmd__final_pass() { lab-loop lead "$1" --final; }
 cmd__stop() {  # as the owner: stop the lead and cancel the project's jobs
   tmux kill-window -t "agents:lead-$1" 2>/dev/null || true
   rm -f "$LAB/state/pass-lead-$1.running"
-  local jobs
-  jobs=$(lab_jobs "$1" | awk '{print $1}')
+  local jobs id
+  jobs=$(lab_jobs "$1" | awk '$1 ~ /^[0-9]/ {print $1}')
   [[ -z $jobs ]] || scancel $jobs
+  for id in $(lab_agents "$1" | awk '{print $1}'); do cmd__stop_agent "$id" || true; done
+}
+
+cmd__stop_agent() {  # as the owner: stop agent <id>'s service (lab-worker then says on its issue how it ended)
+  [[ ${1:-} =~ ^a[0-9]+$ ]] || die "Usage: lab _stop-agent a<N>"
+  if ! user_systemctl is-active --quiet "$AGENT_UNIT_PREFIX-$1"; then
+    echo "Agent $1 isn't running on $(id -un) (already ended)."
+    return 0
+  fi
+  user_systemctl stop --no-block "$AGENT_UNIT_PREFIX-$1"
 }
 
 cmd_limit() {
@@ -326,6 +344,71 @@ cmd_usage() {
   cat "$USAGE/summary.txt" 2> /dev/null || echo "No measurements yet; the watchdog makes them every 30 minutes (or: lab usage --refresh, as hpc)."
 }
 
+limits_write() {  # limits_write <KEY> <value|->: set or remove KEY in limits.conf, under a lock
+  local key=$1 value=$2
+  (
+    flock 9
+    if [[ ! -e $LIMITS_CONF ]]; then
+      printf '%s\n' "# Working values; the director edits these only on the PI's instruction, via \`lab set\`." \
+        "# Ceilings are <KEY>_MAX in /etc/agentbox/lab.conf (root); a value above its ceiling is capped." > "$LIMITS_CONF"
+    fi
+    grep -v "^[[:space:]]*$key=" "$LIMITS_CONF" > "$LIMITS_CONF.tmp" || true
+    [[ $value == - ]] || printf '%s=%s\n' "$key" "$value" >> "$LIMITS_CONF.tmp"
+    mv "$LIMITS_CONF.tmp" "$LIMITS_CONF"
+  ) 9>"$LAB/state/limits.lock"
+}
+
+cmd_set() {
+  local key
+  if [[ $# -eq 0 ]]; then
+    printf '%-26s %-10s %-34s %s\n' KEY VALUE SOURCE CEILING
+    for key in "${LIMIT_KEYS[@]}"; do
+      printf '%-26s %-10s %-34s %s\n' "$key" "${!key}" "${CONF_SRC[$key]}" "${CONF_CEIL[$key]}"
+    done
+    for key in "${POLICY_KEYS[@]}"; do
+      printf '%-26s %-10s %-34s %s\n' "$key" "${!key}" "${CONF_SRC[$key]}" -
+    done
+    return
+  fi
+  key=$1
+  local value=${2:-} reason=""
+  [[ ${3:-} == --reason && -n ${4:-} ]] && reason=$4
+  [[ -n $value && -n $reason ]] || die 'Usage: lab set <KEY> <value>|- --reason "<why>" (lab set alone shows the values)'
+  if [[ " ${LIMIT_KEYS[*]} " == *" $key "* ]]; then
+    if [[ $value != - ]]; then
+      [[ $value =~ ^[0-9]+$ ]] || die "$key takes a whole number."
+      (( value <= CONF_CEIL[$key] )) || die "$key=$value is above its ceiling ${CONF_CEIL[$key]} (${key}_MAX in $LAB_CONF, root's; the PI raises it with sudo)."
+    fi
+  elif [[ " ${POLICY_KEYS[*]} " == *" $key "* ]]; then
+    [[ $value == - ]] || policy_ok "$key" "$value" || die "$key is one of: $( [[ $key == CLAUDE_FALLBACK ]] && echo 'codex, wait' || echo 'claude, codex')."
+  else
+    die "Unknown key $key. Settable: ${LIMIT_KEYS[*]} ${POLICY_KEYS[*]}"
+  fi
+  local old=${!key}
+  limits_write "$key" "$value"
+  load_conf
+  shared_append "$LAB/state/limits-log.tsv" "$(now)"$'\t'"$(id -un)"$'\t'"$key"$'\t'"$old"$'\t'"$value"$'\t'"${reason//[$'\t\n']/ }"
+  if git -C "$LAB" rev-parse --git-dir > /dev/null 2>&1; then
+    git -C "$LAB" add "$LIMITS_CONF" > /dev/null 2>&1 &&
+      git -C "$LAB" commit -q -m "lab: set $key=$value ($reason)" -- "$LIMITS_CONF" > /dev/null 2>&1 || true
+  fi
+  echo "$key is now ${!key} (${CONF_SRC[$key]}); was $old."
+}
+
+cmd_model() {
+  local target=${1:-} model=${2:-} reason="lab model"
+  [[ ${3:-} == --reason && -n ${4:-} ]] && reason=$4
+  [[ $model == claude || $model == codex ]] || die "Usage: lab model <project>|director|default claude|codex [--reason \"<why>\"]"
+  case $target in
+    director) cmd_set DIRECTOR_MODEL "$model" --reason "$reason" ;;
+    default) cmd_set DEFAULT_MODEL "$model" --reason "$reason" ;;
+    *)
+      need_project "$target"
+      registry_update '.projects[$p].lead_model = $m' --arg p "$target" --arg m "$model"
+      echo "Project $target's lead now runs on $model (from its next pass)." ;;
+  esac
+}
+
 cmd_spawn() {
   need_project "${1:-}"
   local project=$1
@@ -333,37 +416,52 @@ cmd_spawn() {
     as_owner "$project" spawn "$@"
     return
   fi
-  local role=${2:-} issue="" model=codex effort="" cpus=4 mem=16G hours=12
+  local role=${2:-} issue="" model=$DEFAULT_MODEL model_given="" effort="" cpus=2 mem=16G hours=12 api_why="" api=""
   [[ $role == worker || $role == explorer || $role == verifier ]] || die "The role is worker, explorer or verifier."
   shift 2
   while [[ $# -gt 0 ]]; do
     case $1 in
       --issue) issue=$2; shift 2 ;;
-      --model) model=$2; shift 2 ;;
+      --model) model=$2; model_given=1; shift 2 ;;
       --effort) effort=$2; shift 2 ;;
       --cpus) cpus=$2; shift 2 ;;
       --mem) mem=$2; shift 2 ;;
       --hours) hours=$2; shift 2 ;;
+      --api) api_why=$2; shift 2 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
   [[ $issue =~ ^[0-9]+$ ]] || die "Give the task's issue number: --issue <n>"
+  [[ $hours =~ ^[0-9]+$ ]] && (( hours >= 1 )) || die "--hours is a whole number of hours, at least 1."
+  [[ $cpus =~ ^[0-9]+$ ]] && (( cpus >= 1 )) || die "--cpus is a whole number, at least 1."
+  mem=${mem^^}; mem=${mem%B}                # 16g, 16GB -> 16G, as Slurm accepts them
+  [[ $mem =~ ^[0-9]+$ ]] && mem=${mem}M     # Slurm reads a bare number as MB; say so for systemd too
+  [[ $mem =~ ^[0-9]+[KMGT]$ ]] || die "--mem is like 16G or 8000M."
   [[ $model == codex || $model == claude ]] || die "--model is codex or claude."
   [[ -z $effort || $effort =~ ^(low|medium|high|xhigh|max)$ ]] || die "--effort is low, medium, high, xhigh or max."
-  [[ $cpus =~ ^[1-9][0-9]{0,2}$ ]] || die "--cpus is a whole number of CPUs, e.g. 2."
-  [[ $mem =~ ^[1-9][0-9]{0,5}[MG]$ ]] || die "--mem is a size like 16G or 4000M."
-  [[ $hours =~ ^[1-9][0-9]{0,2}$ ]] || die "--hours is a whole number of hours, e.g. 8."
   [[ $(project_field "$project" status) == active ]] || die "Project $project isn't active."
-  if [[ $model == codex ]]; then
+  # The default model, with Claude's share used up and CLAUDE_FALLBACK=codex, falls back to Codex.
+  if [[ $model == claude && -z $model_given && $CLAUDE_FALLBACK == codex ]] && ! claude_room; then
+    echo "The lab's Claude share is used up; starting on codex (CLAUDE_FALLBACK=codex)." >&2
+    model=codex
+  fi
+  if [[ $model == codex && -n $api_why ]]; then   # a chosen task on the API: the plan's pace doesn't apply
+    codex_api_room || die "The OpenAI API isn't available: no login in ~/.codex-api, or CODEX_API_BUDGET_USD is spent (lab usage)."
+    api="chosen: $api_why"
+  elif [[ $model == codex ]]; then
     case $(codex_pressure) in
       stop) [[ $role == verifier ]] || die "Codex is at its limit until the window resets (lab usage); only verifiers start now." ;;
       ahead) [[ $role == explorer ]] && die "The lab is using Codex faster than the allowance lasts (lab usage); explorers wait until the pace recovers." ;;
+      api) api="overflow: the plan's window is used up" ;;
     esac
   else
+    [[ -z $api_why ]] || die "--api is for Codex agents (--model codex)."
     claude_room || die "The lab's Claude allowance for this week is used up (lab usage); the rest of the plan is the PI's."
   fi
   local jobs limit
-  jobs=$(lab_jobs "$project")
+  # Compute subjobs consume Slurm resources, not research-agent slots.
+  # Leads must also reserve slots for agents in interactive sessions.
+  jobs=$(lab_jobs "$project" | awk '$2 ~ /^lab:[^:]+:(worker|explorer|verifier):[0-9]+$/')
   limit=$(project_field "$project" limit)
   if awk -v n="lab:$project:$role:$issue" '$2 == n' <<<"$jobs" | grep -q .; then
     die "A $role is already working on issue #$issue."
@@ -379,9 +477,33 @@ cmd_spawn() {
   local folder=$PROJECTS/$project
   mkdir -p "$folder/logs"
   local job
+  if [[ $AGENT_RUNNER == systemd ]]; then
+    # A user service in the shared slice; its CPUs and memory come from the pool, and --cpus/--mem cap
+    # this one agent within it. Its heavy work goes to Slurm (lab-run). lab-worker stops it at --hours.
+    job=$(new_agent_id)
+    agent_pool
+    local -a envs=()
+    local v
+    for v in PATH HOME USER LOGNAME SHELL LANG LC_ALL TERM TZ TMPDIR XDG_CONFIG_HOME LAB_DIR PROJECTS_DIR LAB_CONF \
+             AGENTBOX_SHARE AGENT_UNIT_PREFIX AGENT_SLICE CODEX_HOME GH_CONFIG_DIR http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+      [[ -n ${!v:-} ]] && envs+=(--setenv="$v=${!v}")
+    done
+    user_systemctl reset-failed "$AGENT_UNIT_PREFIX-$job" > /dev/null 2>&1 || true
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} systemd-run --user --quiet --collect \
+      --unit="$AGENT_UNIT_PREFIX-$job" --slice="$AGENT_SLICE" --description="lab:$project:$role:$issue" \
+      -p CPUQuota="${cpus}00%" -p MemoryMax="$mem" -p UMask=0002 -p KillMode=mixed -p TimeoutStopSec=180 \
+      -p RuntimeMaxSec=$(( hours * 3600 + 900 )) --working-directory="$folder" "${envs[@]}" \
+      --setenv=LAB_PROJECT="$project" --setenv=LAB_ROLE="$role" --setenv=LAB_ISSUE="$issue" \
+      --setenv=LAB_MODEL="$model" --setenv=LAB_EFFORT="$effort" --setenv=LAB_AGENT_ID="$job" \
+      --setenv=LAB_HOURS="$hours" --setenv=LAB_CPUS="$cpus" --setenv=LAB_MEM="$mem" ${api:+--setenv=LAB_CODEX_API="$api"} \
+      bash -c "exec $(printf %q "$(command -v lab-worker)") >> $(printf %q "$folder/logs/$job-$role-$issue.out") 2>&1" \
+      || die "systemd-run failed: is lingering on for $(id -un)? (sudo loginctl enable-linger $(id -un))"
+    echo "Started $role for issue #$issue as agent $job ($model${effort:+, effort $effort}${api:+, on the OpenAI API}, outside Slurm, up to $hours h; computations go through lab-run)."
+    return
+  fi
   job=$(sbatch --parsable --job-name="lab:$project:$role:$issue" --cpus-per-task="$cpus" --mem="$mem" \
     --time="$hours:00:00" --signal=B:USR1@300 --output="$folder/logs/%j-$role-$issue.out" --chdir="$folder" \
-    --export="ALL,LAB_PROJECT=$project,LAB_ROLE=$role,LAB_ISSUE=$issue,LAB_MODEL=$model,LAB_EFFORT=$effort" \
+    --export="ALL,LAB_PROJECT=$project,LAB_ROLE=$role,LAB_ISSUE=$issue,LAB_MODEL=$model,LAB_EFFORT=$effort${api:+,LAB_CODEX_API=$api}" \
     "$(command -v lab-worker)")
   echo "Started $role for issue #$issue as Slurm job $job ($model${effort:+, effort $effort}, $cpus CPUs, $mem, up to $hours h)."
 }
@@ -419,9 +541,9 @@ cmd_notify() {
 
 cmd_init() {
   [[ -n ${ORG:-} && -n ${PI_GITHUB:-} ]] || die "Fill in $LAB_CONF first (sudo nano $LAB_CONF, from your own login)."
+  [[ -d $LAB/.git ]] && die "$LAB is already a git repo."
   [[ -z $CONF_PLACEHOLDERS ]] ||
     echo "Warning: still CHANGE-ME in $LAB_CONF, treated as unset:$CONF_PLACEHOLDERS" >&2
-  [[ -d $LAB/.git ]] && die "$LAB is already a git repo."
   render_files "$LAB" ORG="$ORG" PI="$PI_GITHUB"
   git -C "$LAB" init -q -b main
   git -C "$LAB" add -A
@@ -435,7 +557,7 @@ command=${1:-help}
 shift || true
 case $command in
   help|-h|--help) usage ;;
-  status|up|new|adopt|start|pause|resume|retire|limit|budget|usage|spawn|chat|notify|init|_create|_adopt|_start-lead|_final-pass|_stop)
+  status|up|new|adopt|start|pause|resume|retire|limit|budget|usage|set|model|spawn|chat|notify|init|_create|_adopt|_start-lead|_final-pass|_stop|_stop-agent)
     "cmd_${command//-/_}" "$@" ;;
   *) usage 1 ;;
 esac

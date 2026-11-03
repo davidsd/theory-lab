@@ -13,6 +13,7 @@ import glob
 import json
 import math
 import os
+import pwd
 import re
 import socket
 import subprocess
@@ -36,7 +37,37 @@ def _conf(key, default=""):
     return default
 
 
+def _setting(key, default=""):
+    """A working value as lib.sh's load_conf sees it, roughly: lab.conf, then the lab's limits.conf (the
+    dashboard only displays these; the scripts enforce the ceilings)."""
+    value = _conf(key, default)
+    try:
+        for line in open(f"{LAB}/limits.conf"):
+            k, _, v = line.split("#", 1)[0].strip().partition("=")
+            if k == key and v:
+                value = v.strip()
+    except OSError:
+        pass
+    return value
+
+
+def _uid(user):
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None
+
+
+def _pool_dirs():
+    """The agents' capped slice (lab-agents.slice) of each lab account that has one."""
+    for user in ("hpc", "agent"):
+        uid = _uid(user)
+        if uid is not None:
+            yield user, f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/lab.slice/lab-agents.slice"
+
+
 ORG = _conf("ORG")
+PI = _conf("PI_GITHUB")
 _titles = {}  # (project, issue) -> (time, title)
 
 
@@ -288,16 +319,34 @@ def machine():
             busy = (1 - (idle - prev[0]) / (all_ - prev[1])) * os.cpu_count()
     except (OSError, ValueError):
         pass
-    return dict(cpus=os.cpu_count(), alloc=alloc, slurm_cpus=total, busy=busy,
+    pools = []
+    for user, d in _pool_dirs():
+        try:
+            q, period = open(f"{d}/cpu.max").read().split()
+            usec = int(next(l.split()[1] for l in open(f"{d}/cpu.stat") if l.startswith("usage_usec")))
+            memc = int(open(f"{d}/memory.current").read())
+            memmax = open(f"{d}/memory.max").read().strip()
+        except (OSError, ValueError, StopIteration):
+            continue
+        now = time.time()
+        prev = _ticks.get("__pool" + user)
+        _ticks["__pool" + user] = (now, usec)
+        used = (usec - prev[1]) / 1e6 / (now - prev[0]) if prev and now > prev[0] else None
+        n = sum(1 for a in agent_registrations() if a.get("user") == user)
+        pools.append(dict(user=user, cap=None if q == "max" else int(q) / int(period), used=used, mem=memc,
+                          mem_cap=None if memmax == "max" else int(memmax), agents=n))
+    return dict(cpus=os.cpu_count(), alloc=alloc, slurm_cpus=total, busy=busy, pools=pools,
                 load=os.getloadavg(), mem_total=mem.get("MemTotal"),
                 mem_used=mem.get("MemTotal", 0) - mem.get("MemAvailable", 0))
 
 
-def claude_live(cwd):
+def claude_live(cwd, user=None):
     """A running Claude worker's latest message (and what it is doing now) from its live transcript.
-    claude -p writes its own log only at the end; the transcript is written as it goes."""
+    claude -p writes its own log only at the end; the transcript is written as it goes, in the home of the
+    account the worker runs as (the agent account's needs an ACL letting hpc read ~/.claude/projects)."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
-    sessions = sorted(glob.glob(f"{HOME}/.claude/projects/{slug}/*.jsonl"), key=os.path.getmtime)
+    home = os.path.expanduser(f"~{user}") if user else HOME
+    sessions = sorted(glob.glob(f"{home}/.claude/projects/{slug}/*.jsonl"), key=os.path.getmtime)
     if not sessions:
         return dict(message=None, updated=None)
     path = sessions[-1]
@@ -335,9 +384,13 @@ def claude_live(cwd):
 def jobs():
     out = run(["squeue", "-h", "-o", "%i|%j|%T|%M|%l|%C|%m|%u"])
     rows = []
+    compute = {}   # agent id -> its lab-run Slurm jobs (named lab:<project>:run:<issue>:<agent>)
     for line in out.splitlines():
         jid, name, state, elapsed, limit, cpus, mem, user = line.split("|")
         parts = name.split(":")
+        if len(parts) == 5 and parts[0] == "lab" and parts[2] == "run":
+            compute.setdefault(parts[4], []).append(dict(job=jid, state=state.lower(), elapsed=elapsed, limit=limit, cpus=cpus))
+            continue
         if len(parts) != 4 or parts[0] != "lab":
             continue
         _, project, role, issue = parts
@@ -352,7 +405,97 @@ def jobs():
                          model_label=model_label(fam, log, f"{PROJECTS}/{project}/jobs/{jid}", role),
                          title=issue_title(project, issue),
                          **(dict(message=msg, updated=mtime) if msg or fam != "Claude"
-                            else claude_live(f"{PROJECTS}/{project}/jobs/{jid}")),
+                            else claude_live(f"{PROJECTS}/{project}/jobs/{jid}", user)),
+                         url=f"https://github.com/{ORG}/{project}/issues/{issue}"))
+    rows += agent_rows(compute)
+    return rows
+
+
+def agent_registrations():
+    out = []
+    for f in glob.glob(f"{LAB}/state/agents/a*.json"):
+        try:
+            out.append(json.load(open(f)))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def agent_clone_procs(clone):
+    """Processes whose command line names an agent's clone (codex --cd <clone> ...)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                args = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if args and args[0].endswith(b"codex") and clone.encode() in args:
+                out.append(d)
+    return out
+
+
+def descendants(pid):
+    """pid and all its descendant processes, from /proc."""
+    children = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                ppid = open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()[1]
+                children.setdefault(ppid, []).append(d)
+            except (OSError, IndexError):
+                pass
+    out, todo = [], [str(pid)]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        todo += children.get(p, [])
+    return out
+
+
+def agent_rows(compute=None):
+    """Agents running outside Slurm (AGENT_RUNNER=systemd), from their registrations in state/agents."""
+    compute = compute or {}
+    rows = []
+    for f in glob.glob(f"{LAB}/state/agents/a*.json"):
+        try:
+            a = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        pid = str(a.get("pid", ""))
+        try:   # alive only if that pid is the agent's own service (not a reused pid)
+            cg = open(f"/proc/{pid}/cgroup").read().strip().split("::", 1)[-1]
+        except OSError:
+            continue
+        if not re.fullmatch(r"a\d+", str(a.get("id", ""))) or not cg.endswith(f"/lab-agent-{a['id']}.service"):
+            continue
+        parts = a.get("name", "").split(":")
+        if len(parts) != 4:
+            continue
+        _, project, role, issue = parts
+        jid = a["id"]
+        e = int(time.time() - a.get("start", time.time()))
+        elapsed = (f"{e // 86400}-{e % 86400 // 3600:02d}:{e % 3600 // 60:02d}:{e % 60:02d}" if e >= 86400
+                   else f"{e // 3600}:{e % 3600 // 60:02d}:{e % 60:02d}" if e >= 3600 else f"{e // 60}:{e % 60:02d}")
+        log = f"{PROJECTS}/{project}/logs/{jid}-{role}-{issue}.jsonl"
+        try:   # every process in the service (lab-worker, the tmux server, a Claude agent)
+            pids = open(f"/sys/fs/cgroup{cg}/cgroup.procs").read().split()
+        except OSError:
+            pids = descendants(pid)
+        # tmux puts each pane (an interactive Codex agent) in its own scope beside the service: find it by its clone
+        for q in agent_clone_procs(f"{PROJECTS}/{project}/jobs/{jid}"):
+            pids += [x for x in descendants(q) if x not in pids]
+        msg, mtime = last_message(log)
+        ticks, rss = proc_usage(pids)
+        rows.append(dict(cpu_used=cpu_used(jid, ticks), rss=rss, kind=role, project=project, issue=issue, job=jid, state="running",
+                         pool=True, compute=compute.get(jid, []),
+                         elapsed=elapsed, limit=f"{a.get('hours', '?')}:00:00", cpus=a.get("cpus", "?"),
+                         mem=a.get("mem", ""), user=a.get("user", ""),
+                         model=(fam := model_of(log, pids)),
+                         model_label=model_label(fam, log, f"{PROJECTS}/{project}/jobs/{jid}", role),
+                         title=issue_title(project, issue),
+                         **(dict(message=msg, updated=mtime) if msg or fam != "Claude"
+                            else claude_live(f"{PROJECTS}/{project}/jobs/{jid}", a.get("user"))),
                          url=f"https://github.com/{ORG}/{project}/issues/{issue}"))
     return rows
 
@@ -378,6 +521,34 @@ def _last_label(family, logs_glob, cwd, role):
     return model_label(family, logs[-1], cwd, role) if logs else _conf_label(family, role)
 
 
+def people(project):
+    """Collaborators from the "People" table of the project's AGENTS.md (the lab and the PI left out): name and
+    profile link per handle. GitHub unless written gitlab:<handle>."""
+    try:
+        text = open(f"{PROJECTS}/{project}/AGENTS.md").read()
+    except OSError:
+        return []
+    m = re.search(r"^## *People\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    out = []
+    for line in (m.group(1) if m else "").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or not line.lstrip().startswith("|"):
+            continue
+        handles = re.findall(r"`([^`]+)`", cells[0])
+        if not handles or handles[0] in ("lab", PI):
+            continue
+        name = re.sub(r"\s*\([^)]*\)", "", cells[1])            # "(human)", "(human, GitHub @x)"
+        name = re.sub(r",?\s*and (his|her|their) agents?", "", name).strip(" ,") or handles[0]
+        links = []
+        for h in handles:
+            if h.startswith("gitlab:"):
+                links.append(dict(handle=h, url=f"https://gitlab.com/{h.split(':', 1)[1]}"))
+            else:
+                links.append(dict(handle=h, url=f"https://github.com/{h}"))
+        out.append(dict(name=name, handles=links, role=cells[2] if len(cells) > 2 else ""))
+    return out
+
+
 def leads(registry):
     rows = []
     for project, p in sorted(registry.get("projects", {}).items()):
@@ -387,10 +558,19 @@ def leads(registry):
             f"{LAB}/state/pass-lead-{project}.running",
             f"{PROJECTS}/{project}/logs/lead-*.jsonl",
             f"{PROJECTS}/{project}/logs/lead-last.md")
+        fam = (p.get("lead_model") or "codex").capitalize()
+        if running and not msg and fam == "Claude":
+            # claude -p writes the pass's log only at the end: read the live transcript (the newest session in
+            # the project folder, in the lead account's home), as for Claude workers.
+            live = claude_live(f"{PROJECTS}/{project}", p.get("account"))
+            if live.get("message") and (live.get("updated") or 0) >= (since or 0):
+                msg, mtime = live["message"], live["updated"]
+        if running and not msg:   # nothing yet from this pass: show the last pass's summary
+            msg, mtime = last, last_time
         rows.append(dict(kind="lead", project=project, status=p.get("status"), limit=p.get("limit"),
-                         account=p.get("account"), model=(fam := (p.get("lead_model") or "codex").capitalize()),
+                         account=p.get("account"), model=fam,
                          model_label=_last_label(fam, f"{PROJECTS}/{project}/logs/lead-*.jsonl", f"{PROJECTS}/{project}", "lead"),
-                         budget=p.get("hpc_sus_month"),
+                         budget=p.get("hpc_sus_month"), people=people(project),
                          running=running, since=since, message=msg if running else last,
                          updated=mtime if running else last_time,
                          url=f"https://github.com/{ORG}/{project}"))
@@ -401,7 +581,10 @@ def director():
     running, since, msg, mtime, last, last_time = pass_info(
         f"{LAB}/state/pass-director.running", f"{LAB}/state/logs/director-*.jsonl",
         f"{LAB}/state/director-last.md")
-    return dict(kind="director", model="Codex", model_label=_last_label("Codex", f"{LAB}/state/logs/director-*.jsonl", LAB, "director"),
+    fam = _setting("DIRECTOR_MODEL", "codex").capitalize()
+    if running and not msg:   # a Claude pass logs only at the end (its transcript shares the lab folder with the PI's chat)
+        msg, mtime = last, last_time
+    return dict(kind="director", model=fam, model_label=_last_label(fam, f"{LAB}/state/logs/director-*.jsonl", LAB, "director"),
                 running=running, since=since,
                 message=msg if running else last, updated=mtime if running else last_time)
 
@@ -467,8 +650,137 @@ def usage():
     except Exception:
         pass
     data["mtime"] = os.path.getmtime(summary)
+    try:
+        data.setdefault("claude", {})["credits"] = credits()
+    except Exception:
+        pass
+    try:   # the center's own report on the allocation (lab-usage saves HPC_BALANCE_CMD's output), shown as text
+        path = f"{usage_dir}/hpc-allocation.txt"
+        data.setdefault("hpc", {})["allocation"] = dict(text=open(path).read()[:3000], as_of=os.path.getmtime(path))
+    except OSError:
+        pass
+    try:
+        data.setdefault("hpc", {})["scratch"] = json.load(open(SCRATCH))
+    except (OSError, ValueError):
+        pass
     return data
 
+
+
+# --- Claude credits: what the lab's Claude runs cost (each claude -p result line reports total_cost_usd, at API
+# prices), and the balance the PI last reported. The account's balance itself can't be read from the machine, so
+# the PI (or the director, relaying the PI's words) appends a line to state/usage/claude-credits.tsv:
+# <epoch>\t<balance in USD>\t<note>, e.g. after buying credits or reading the balance on the account page.
+
+CREDITS_LOG = f"{LAB}/state/usage/claude-credits.tsv"  # time, balance in USD, note: the PI's reported balances/deposits
+PLAN_LOG = f"{LAB}/state/usage/claude-plan.tsv"  # seen, 5-hour %, its reset, week %, its reset: each new plan reading
+
+
+def record_plan():
+    """Append the plan's latest reading (claude-limits.json) when it is new, so runs can later be dated against it."""
+    try:
+        p = json.load(open(f"{LAB}/state/usage/claude-limits.json"))
+        h = p.get("five_hour") or {}   # plans without a 5-hour limit report none
+        row = [p["seen"], h.get("used_percentage", 0), h.get("resets_at", 0),
+               p["seven_day"]["used_percentage"], p["seven_day"]["resets_at"]]
+        last = open(PLAN_LOG).read().rstrip("\n").rsplit("\n", 1)[-1].split("\t") if os.path.exists(PLAN_LOG) else []
+        if not last or float(last[0]) < row[0]:
+            with open(PLAN_LOG, "a") as f:
+                f.write("\t".join(str(x) for x in row) + "\n")
+    except Exception:
+        pass
+
+
+def plan_full_at():
+    """A function t -> True when the plan was used up at time t (5-hour or weekly limit at 100%, not yet reset),
+    i.e. when Claude was running on credits. Uses the latest reading at or before t, however old: readings come
+    only from interactive Claude sessions, so they can be hours apart, and a full window stays full until its reset."""
+    rows = []
+    try:
+        for l in open(PLAN_LOG):
+            f = l.split("\t")
+            if len(f) >= 5 and not l.startswith("#"):
+                rows.append([float(x) for x in f[:5]])
+    except OSError:
+        pass
+    rows.sort()
+    times = [r[0] for r in rows]
+
+    def full(t):
+        import bisect
+        i = bisect.bisect_right(times, t) - 1
+        if i < 0:
+            return False
+        _, h, hr, w, wr = rows[i]
+        return (h >= 100 and t < hr) or (w >= 100 and t < wr)
+    return full
+_cost_cache = {}   # path -> (mtime, [(time, cost)])
+COST_GLOBS = [f"{PROJECTS}/*/logs/*.jsonl", f"{LAB}/state/logs/*.jsonl"]
+
+
+def _file_costs(path):
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return []
+    hit = _cost_cache.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    out = []
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                if b'"total_cost_usd"' in line and b'"type":"result"' in line:
+                    try:
+                        d = json.loads(line)
+                        out.append((mt, float(d.get("total_cost_usd") or 0), (d.get("duration_ms") or 0) / 1000))
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+    _cost_cache[path] = (mt, out)
+    return out
+
+
+def credits():
+    now, spend = time.time(), []   # (time, project, cost); a run is dated by when its log was last written
+    for g in COST_GLOBS:
+        for path in glob.glob(g):
+            if now - os.path.getmtime(path) > 8 * 86400:
+                continue
+            project = "director" if path.startswith(f"{LAB}/") else os.path.relpath(path, PROJECTS).split("/")[0]
+            spend += [(t, project, c, dur) for t, c, dur in _file_costs(path)]
+    record_plan()
+    full = plan_full_at()
+    # Only what ran while the plan was used up was paid from credits. A run's cost is taken as spread evenly over
+    # its duration (it ends when its log was last written), so a long run is split between plan and credits.
+    spend = [(t, p, c * sum(full(t - d * (k + 0.5) / 20) for k in range(20)) / 20) for t, p, c, d in spend]
+    day = sum(c for t, _, c in spend if now - t <= 86400)
+    week = sum(c for t, _, c in spend if now - t <= 7 * 86400)
+    by = {}
+    for t, p, c in spend:
+        if now - t <= 86400:
+            by[p] = by.get(p, 0) + c
+    try:
+        first = float(open(PLAN_LOG).readline().split("\t")[0])
+    except Exception:
+        first = now
+    out = dict(day=round(day, 2), week=round(week, 2), by_project_day={k: round(v, 2) for k, v in by.items()},
+               tracked_since=first)
+    try:
+        rows = [l.rstrip("\n").split("\t") for l in open(CREDITS_LOG) if l.strip() and not l.startswith("#")]
+        t0, bal, note = float(rows[-1][0]), float(rows[-1][1]), rows[-1][2] if len(rows[-1]) > 2 else ""
+        since = sum(c for t, _, c in spend if t > t0)
+        out.update(reported=bal, reported_at=t0, reported_note=note, spent_since=round(since, 2),
+                   estimate=round(bal - since, 2))
+    except Exception:
+        pass
+    mode = _setting("CLAUDE_CREDITS", "off")
+    out_flag = f"{LAB}/state/usage/claude-credits-out"
+    if mode == "on" and os.path.exists(out_flag) and now - os.path.getmtime(out_flag) < 6 * 3600:
+        mode = "paused"   # a run failed for lack of credits: Claude waits 6 h (lib.sh claude_credits_out)
+    out["mode"] = mode
+    return out
 
 
 # --- How many more workers fit: from samples of plan usage and of the number of running workers.
@@ -593,7 +905,162 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# --- Capacity statistics, for deciding the numbers later (agent pool, project limits, machine size). Every 5
+# minutes, one JSON line in state/usage/capacity.jsonl: Slurm CPUs given out and actually busy, the agent pools,
+# memory, the queue (how many wait, how long), lab-run jobs, and agents per project against its limit.
+# `lab-capacity` summarizes it.
+CAPACITY = f"{LAB}/state/usage/capacity.jsonl"
+
+
+def _cg_cpu_usec(path):
+    try:
+        return int(next(l.split()[1] for l in open(f"{path}/cpu.stat") if l.startswith("usage_usec")))
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def capacity_sample(prev):
+    now = time.time()
+    v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    idle, all_ = v[3] + v[4], sum(v[:8])
+    cur = {"t": now, "idle": idle, "all": all_}
+    rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cpus": os.cpu_count(), "load1": os.getloadavg()[0]}
+    if prev and all_ > prev["all"]:
+        rec["busy_cpus"] = round((1 - (idle - prev["idle"]) / (all_ - prev["all"])) * os.cpu_count(), 2)
+    mem = {}
+    for line in open("/proc/meminfo"):
+        k, val = line.split(":")
+        mem[k] = int(val.split()[0]) * 1024
+    rec["mem_used_gb"] = round((mem["MemTotal"] - mem["MemAvailable"]) / 1e9, 2)
+    rec["mem_total_gb"] = round(mem["MemTotal"] / 1e9, 2)
+    out = run(["sinfo", "-h", "-o", "%C"]).strip().split("/")
+    if len(out) == 4:
+        rec["slurm_alloc"], rec["slurm_total"] = int(out[0]), int(out[3])
+    # The queue: running and pending jobs, CPUs asked, and how long the pending ones have waited.
+    q = {"running": 0, "pending": 0, "pending_cpus": 0, "max_wait_min": 0, "lab_run_running": 0, "lab_run_pending": 0,
+         "slurm_agents": 0}
+    for line in run(["squeue", "-h", "-o", "%i|%j|%T|%C|%V"]).splitlines():
+        try:
+            jid, name, state, cpus, submit = line.split("|")
+        except ValueError:
+            continue
+        parts = name.split(":")
+        if len(parts) == 5 and parts[2] == "run":
+            q["lab_run_running" if state == "RUNNING" else "lab_run_pending"] += 1
+        if len(parts) == 4 and parts[0] == "lab" and parts[2] in ("worker", "explorer", "verifier") and state == "RUNNING":
+            q["slurm_agents"] += 1
+        if state == "RUNNING":
+            q["running"] += 1
+        elif state == "PENDING":
+            q["pending"] += 1
+            q["pending_cpus"] += int(cpus) if cpus.isdigit() else 0
+            try:
+                w = (now - time.mktime(time.strptime(submit, "%Y-%m-%dT%H:%M:%S"))) / 60
+                q["max_wait_min"] = max(q["max_wait_min"], round(w))
+            except ValueError:
+                pass
+    rec["queue"] = q
+    # The agent pools, per account.
+    pools = {}
+    for user, d in _pool_dirs():
+        usec = _cg_cpu_usec(d)
+        if usec is None:
+            continue
+        cur["pool_" + user] = usec
+        p = {}
+        try:
+            qv, period = open(f"{d}/cpu.max").read().split()
+            p["cap"] = None if qv == "max" else int(qv) / int(period)
+            p["mem_gb"] = round(int(open(f"{d}/memory.current").read()) / 1e9, 2)
+        except (OSError, ValueError):
+            pass
+        if prev and prev.get("pool_" + user) is not None:
+            p["used"] = round((usec - prev["pool_" + user]) / 1e6 / (now - prev["t"]), 2)
+        pools[user] = p
+    rec["pools"] = pools
+    # Agents per project (outside Slurm and in it) against the project's limit.
+    try:
+        reg = json.load(open(f"{LAB}/registry.json")).get("projects", {})
+    except (OSError, ValueError):
+        reg = {}
+    counts = {}
+    for a in agent_registrations():
+        parts = a.get("name", "").split(":")
+        if len(parts) == 4:
+            counts[parts[1]] = counts.get(parts[1], 0) + 1
+    for line in run(["squeue", "-h", "-t", "R,PD", "-o", "%j"]).splitlines():
+        parts = line.split(":")
+        if len(parts) == 4 and parts[0] == "lab" and parts[2] in ("worker", "explorer", "verifier"):
+            counts[parts[1]] = counts.get(parts[1], 0) + 1
+    rec["projects"] = {k: {"agents": counts.get(k, 0), "limit": v.get("limit"), "status": v.get("status")}
+                       for k, v in reg.items() if v.get("status") in ("active", "paused")}
+    try:
+        u = json.load(open(f"{LAB}/state/usage/summary.json"))
+        rec["claude_week_pct"] = ((u.get("claude") or {}).get("plan") or {}).get("seven_day", {}).get("used_percentage")
+        rec["codex_week_pct"] = max((w.get("used_percent", 0) for w in (u.get("codex") or {}).get("windows", [])), default=None)
+    except (OSError, ValueError):
+        pass
+    return rec, cur
+
+
+SCRATCH = f"{LAB}/state/usage/hpc-scratch.json"
+_SAFE = re.compile(r"[A-Za-z0-9_./-]+")
+
+
+def scratch_sample():
+    """The cluster's scratch quota (Lustre `lfs quota`) for the lab's group (HPC_SCRATCH_GROUP; on many centers the
+    group's limit is the one that matters, since everyone in the allocation shares it) and for HPC_USER, on the
+    filesystem HPC_SCRATCH_FS, via the shared connection (hpc-check first, so a lost connection costs nothing).
+    Unset HPC_SCRATCH_FS: nothing is sampled."""
+    fs, group, user = _conf("HPC_SCRATCH_FS"), _conf("HPC_SCRATCH_GROUP"), _conf("HPC_USER")
+    if not fs or not all(_SAFE.fullmatch(x) for x in (fs, group or "x", user or "x")):
+        return
+    if subprocess.run(["hpc-check"], capture_output=True, timeout=60).returncode:
+        return
+    cmds = ([f"lfs quota -g {group} {fs}"] if group else []) + ([f"lfs quota -u {user} {fs}"] if user else [])
+    if not cmds:
+        return
+    out = subprocess.run(["ssh", "-n", "cluster", "; ".join(cmds)], capture_output=True, text=True, timeout=120).stdout
+    # lfs prints the filesystem and the numbers on one line, or on two when the name is long: drop the name.
+    rows = [l.split()[1:] if l.split()[:1] == [fs] else l.split() for l in out.splitlines()]
+    nums = [r for r in rows if r and r[0].rstrip("*").isdigit()]
+    if len(nums) < len(cmds):   # kbytes used, quota, limit, (grace), files ...; a '*' marks over a limit
+        return
+    rec = dict(time=time.time())
+    if group:
+        g = nums.pop(0)
+        rec.update(group=group, group_used_kb=int(g[0].rstrip("*")), group_limit_kb=int(g[2].rstrip("*")))
+    if user:
+        u = nums.pop(0)
+        rec.update(user=user, user_used_kb=int(u[0].rstrip("*")), user_limit_kb=int(u[2].rstrip("*")))
+    tmp = SCRATCH + ".tmp"
+    open(tmp, "w").write(json.dumps(rec))
+    os.replace(tmp, SCRATCH)
+
+
+def capacity_loop(every=300):
+    prev, n = None, 0
+    while True:
+        if n % 6 == 0:   # every 30 minutes
+            try:
+                scratch_sample()
+            except Exception:
+                pass
+        n += 1
+        record_plan()   # plan readings, also when nobody has the page open
+        try:
+            rec, cur = capacity_sample(prev)
+            if prev is not None:   # the first sample only sets the baseline for CPU rates
+                with open(CAPACITY, "a") as f:
+                    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            prev = cur
+        except Exception:
+            pass
+        time.sleep(every)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=capacity_loop, daemon=True).start()
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()

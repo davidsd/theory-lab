@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# lab-settings-propose <KEY> <new value> "<plain-language what and why>": post a proposal to change a root-owned
+# setting in /etc/agentbox/lab.conf on the settings issue (/etc/agentbox/settings-issue), for the PI to approve
+# from a phone; lab-settings-apply (root, every 3 minutes) applies it once the PI replies `approve P<n>`. Only the
+# director proposes, and only on the PI's request (LAB-RULES.md, "Finite resources"). Installed with
+# `install.sh --settings <issue>`.
+set -euo pipefail
+issue_file=/etc/agentbox/settings-issue
+[[ -r $issue_file ]] || { echo "No settings issue: the PI installs lab-settings-apply first (install.sh --settings)." >&2; exit 1; }
+read -r REPO ISSUE < "$issue_file"
+[[ $REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && $ISSUE =~ ^[0-9]+$ ]] || { echo "Can't read $issue_file." >&2; exit 1; }
+key=${1:-} to=${2:-} why=${3:-}
+[[ $key =~ ^[A-Z][A-Z0-9_]*$ && $to =~ ^[0-9]+$ && -n $why ]] || { echo 'Usage: lab-settings-propose KEY VALUE "what and why"' >&2; exit 1; }
+max=$(awk -v k="$key" '$1 == k {print $2}' /etc/agentbox/settings-max.conf 2> /dev/null || true)
+[[ -n $max ]] || { echo "$key isn't on the list the PI can approve this way (/etc/agentbox/settings-max.conf)." >&2; exit 1; }
+(( to <= max )) || { echo "$to is above the hard maximum $max for $key." >&2; exit 1; }
+from=$(sed -nE "s/^[[:space:]]*$key=([0-9]*).*/\1/p" /etc/agentbox/lab.conf | head -1)
+n=$(( $(gh issue view "$ISSUE" -R "$REPO" --json comments --jq '[.comments[].body | scan("<!-- lab-setting P([0-9]+)") | .[0] | tonumber] | max // 0') + 1 ))
+gh issue comment "$ISSUE" -R "$REPO" --body "**P$n: $why**
+
+\`$key\`: ${from:-(unset)} → **$to** (hard maximum $max).
+
+Reply \`approve P$n\` to apply it, or \`cancel P$n\`. Don't edit this comment: an edited proposal is refused.
+<!-- lab-setting P$n KEY=$key FROM=$from TO=$to -->"

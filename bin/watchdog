@@ -3,10 +3,12 @@
 # (`lab up` starts it). It
 #   - pushes every new inbox issue labeled `interrupt` to the PI's phone;
 #   - acts on the PI's answers to held HPC jobs and to new projects' charters (approve or cancel);
+#   - releases HPC jobs queued only by the daily limit once they fit (hpc-release-queued);
+#   - posts the results of settings changes the PI approved from a phone (lab-settings-apply);
 #   - measures the lab's resources every 30 minutes (lab-usage);
 #   - pushes a notification when a Claude session has waited at a permission prompt for 10 minutes,
 #     a lead or director pass has run for 2 hours, a worker's log hasn't changed for an hour,
-#     Codex reaches its limit, the lab passes 90% of its monthly HPC budget, the HPC
+#     the lab passes 90% of its monthly HPC budget, the HPC
 #     connection is down, Slurm's node isn't healthy, or the disk is over 85% full.
 # A problem that persists is pushed again every 6 hours, not every 5 minutes.
 set -uo pipefail
@@ -150,16 +152,35 @@ check_workers() {
 }
 
 check_resources() {
-  if [[ $(codex_pressure) == stop ]]; then
-    alert codex-limit "Codex is at its limit" "The lab pauses until the window resets; see lab usage."
-  else
-    resolved codex-limit
-  fi
+  # No push for Codex's plan limit: a used-up window is an expected state the lab handles itself (credits,
+  # the API, waiting), and a push every week teaches the PI to ignore pushes. lab usage and the dashboard show it.
   local month budget
   month=$(jq -r '.hpc.lab_sus // 0' "$USAGE/summary.json" 2> /dev/null || echo 0)
   if (( month * 10 >= HPC_LAB_SUS_PER_MONTH * 9 )); then
     alert_once "hpc-budget-$(date +%Y-%m)" "HPC: 90% of the monthly budget used" "$month of $HPC_LAB_SUS_PER_MONTH SUs; bigger jobs now wait for you."
   fi
+}
+
+# Jobs hpc-submit queued (held only by the rolling 24-h limit) go out as soon as they fit every limit.
+release_queued() {
+  [[ ${WATCH_HPC:-no} == yes ]] || return 0
+  hpc-release-queued 2>&1 | sed "s/^/$(now) /"
+}
+
+# Results of settings changes the PI approved on the settings issue (root's lab-settings-apply writes them;
+# install.sh --settings installs it): post each once on that issue, so the PI and the director see what happened.
+post_settings_results() {
+  local results=/var/lib/lab-settings/results.jsonl issue_file=/etc/agentbox/settings-issue posted=$LAB/state/settings-posted
+  local repo num tag what
+  [[ -r $results && -r $issue_file ]] || return 0
+  read -r repo num < "$issue_file"
+  while IFS=$'\t' read -r tag what; do
+    grep -qxF -- "$tag" "$posted" 2> /dev/null && continue
+    timeout 60 gh issue comment "$num" -R "$repo" --body "lab-settings-apply: $what." > /dev/null < /dev/null &&
+      echo "$tag" >> "$posted"
+  done < <(jq -r '[(.proposal + ":" + (.time | tostring)),
+      (if .result == "applied" then "\(.proposal) applied: `\(.key)` \(if .frm == "" then "(unset)" else .frm end) → \(.to)"
+       else "\(.proposal) \(.result)" end)] | @tsv' "$results" 2> /dev/null)
 }
 
 check_machine() {
@@ -188,6 +209,8 @@ while :; do
   round=$(( round + 1 ))
   check_interrupts
   check_hpc_approvals
+  release_queued
+  post_settings_results
   check_charters
   check_permission_waits
   check_passes

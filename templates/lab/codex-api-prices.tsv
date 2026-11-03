@@ -1,0 +1,5 @@
+# OpenAI API prices for Codex runs on the API (CODEX_API, lab spawn --api), read by lib.sh's record_api_run.
+# Columns, tab-separated: model, then USD per 1M tokens of input, cached input, output. The first row is the
+# default for models not listed. Copy the current numbers from OpenAI's pricing page for the models in
+# models.conf, and note the date you checked. Until a row with prices is here, the lab doesn't use the API.
+# model	input	cached	output

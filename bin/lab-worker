@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# lab-worker: the body of a worker's Slurm job (`lab spawn` submits it). Claims the issue for the lab,
+# lab-worker: the body of a worker's job (`lab spawn` starts it: a user service in the agents' pool with
+# AGENT_RUNNER=systemd, or a Slurm job with AGENT_RUNNER=slurm). Claims the issue for the lab,
 # gives the agent its own clone of the project (jobs/<job>, where it commits and pushes like any
 # collaborator), runs one agent session there inside the job's CPUs and memory, then comments on the
 # issue saying how the job ended, so the lead learns about crashes, time limits and cancellations too.
-# Slurm signals USR1 five minutes before the time limit (`lab spawn` asks for that) and TERM on
-# cancellation; either stops the agent cleanly.
+# USR1 comes five minutes before the time limit (from Slurm, which `lab spawn` asks for, or from the
+# timer below outside Slurm) and TERM on cancellation; either stops the agent cleanly.
 #
 # Codex agents run interactively (LAB_INTERACTIVE=no for the old non-interactive way): the session
 # lives in its own tmux server inside the job (socket lab-<job>), so the PI can attach and type to the
@@ -18,8 +19,29 @@ set -uo pipefail
 source "${AGENTBOX_SHARE:-/usr/local/share/agentbox}/lib.sh"
 
 project=$LAB_PROJECT role=$LAB_ROLE issue=$LAB_ISSUE model=${LAB_MODEL:-codex}
+# On the OpenAI API (lab spawn: CODEX_API overflow, or --api): Codex uses this account's API login.
+[[ $model == codex && -n ${LAB_CODEX_API:-} ]] && export CODEX_HOME=$HOME/.codex-api
 folder=$PROJECTS/$project
-job=${SLURM_JOB_ID:-local}
+job=${SLURM_JOB_ID:-${LAB_AGENT_ID:-local}}
+# Outside Slurm (lab spawn with AGENT_RUNNER=systemd): register, so lab_jobs, the watchdog and the
+# dashboard see this agent; warn it 5 minutes before its time limit the way Slurm's --signal does; and on
+# the way out cancel the Slurm helpers it started with lab-run (named lab:<project>:run:<issue>:<id>).
+if [[ -z ${SLURM_JOB_ID:-} && -n ${LAB_AGENT_ID:-} ]]; then
+  mkdir -p "$AGENTS_DIR"
+  (umask 002; jq -n --arg id "$job" --arg name "lab:$project:$role:$issue" --arg user "$(id -un)" \
+     --argjson pid $$ --argjson start "$(date +%s)" --arg unit "$AGENT_UNIT_PREFIX-$job" \
+     --arg hours "${LAB_HOURS:-12}" --arg cpus "${LAB_CPUS:-2}" --arg mem "${LAB_MEM:-16G}" \
+     '{id: $id, name: $name, user: $user, unit: $unit, pid: $pid, start: $start, hours: $hours, cpus: $cpus, mem: $mem}' \
+     > "$AGENTS_DIR/$job.json")
+  ( sleep $(( ${LAB_HOURS:-12} * 3600 - 300 )); kill -USR1 $$ 2> /dev/null ) &
+  timer=$!
+  agent_cleanup() {
+    pkill -P "$timer" 2> /dev/null; kill "$timer" 2> /dev/null
+    scancel --name="lab:$project:run:$issue:$job" 2> /dev/null || true
+    rm -f "$AGENTS_DIR/$job.json"
+  }
+  trap agent_cleanup EXIT
+fi
 log=$folder/logs/$job-$role-$issue.jsonl
 last=$folder/logs/$job-$role-$issue-last.md
 mkdir -p "$folder/logs"
@@ -45,8 +67,21 @@ for shared in data code logs worktrees; do
   ln -s "$folder/$shared" "$work/$shared"
 done
 
-prompt=$(render_role "$role" PROJECT="$project" ORG="$ORG" PI="$PI_GITHUB" ISSUE="$issue" JOB="$job" \
-  CPUS="${SLURM_CPUS_PER_TASK:-?}" MEM="$(( ${SLURM_MEM_PER_NODE:-0} / 1024 )) GB" DATE="$(date +%F)")
+if [[ -n ${SLURM_JOB_ID:-} ]]; then
+  where="You run as Slurm job $job on agentbox, with ${SLURM_CPUS_PER_TASK:-?} CPUs and $(( ${SLURM_MEM_PER_NODE:-0} / 1024 )) GB of memory; stay within them, and submit Slurm jobs for bigger runs."
+else
+  where="You run as agent $job on agentbox, outside Slurm, in a pool of CPUs shared by all the lab's agents (use at most ${LAB_CPUS:-2} CPUs and ${LAB_MEM:-16G} of memory). The pool is for thinking, reading, git and quick checks (under about a minute on one CPU). Run anything heavier through Slurm, so CPUs are held only while something computes:
+- One command: \`lab-run --cpus N [--mem 8G] [--hours H] -- <command>\` runs it as a Slurm job and waits for the result.
+- Many small heavy steps: reserve once with \`lab-run --alloc --cpus N [--mem 8G] [--hours H]\` (it prints a job id), run each step with \`srun --jobid=<id> --overlap <command>\`, and release it with \`lab-run --release <id>\` as soon as you are done. Don't hold an allocation while you think.
+- Long runs that should outlive this session: \`sbatch --job-name=lab:$project:<what> ...\`.
+The \`lab-run\` helpers are cancelled when your session ends; \`sbatch\` jobs are not."
+fi
+prompt=$(render_role "$role" PROJECT="$project" ORG="$ORG" PI="$PI_GITHUB" ISSUE="$issue" JOB="$job" WHERE="$where" \
+  CPUS="${SLURM_CPUS_PER_TASK:-${LAB_CPUS:-2}}" MEM="$(( ${SLURM_MEM_PER_NODE:-0} / 1024 )) GB" DATE="$(date +%F)")
+# A role text from before {{WHERE}} still says "You run as Slurm job ...": outside Slurm, say where it really runs.
+if [[ -z ${SLURM_JOB_ID:-} ]] && ! grep -qF '{{WHERE}}' "$LAB/roles/$role.md"; then
+  prompt+=$'\n\n## Where you run (this replaces the Slurm job, CPUs and memory named above)\n\n'"$where"
+fi
 
 stopped=""
 stop_agent() {
