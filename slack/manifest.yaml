@@ -24,6 +24,7 @@ oauth_config:
       - im:write
       - users:read
       - files:read
+      - files:write          # lab-slack post --attach (summary PDFs)
       - chat:write
       - reactions:write
 settings:

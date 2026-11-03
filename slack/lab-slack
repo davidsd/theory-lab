@@ -4,7 +4,8 @@
   lab-slack status                          channels, modes, last sync, waiting posts
   lab-slack sync [--force]                  mirror channels whose interval has passed; deliver posts
   lab-slack post --project <p> --role <r> --channel <workspace>/<channel> [--thread <ts>] (--file <f> | --text <t>)
-                                            queue a post; it goes out (or to the PI as a draft) at the next sync
+                [--attach <pdf|png>]        queue a post; it goes out (or to the PI as a draft) at the next sync.
+                                            --attach uploads one file from the project's folder with the post
 
 Only `sync` (run from hpc's crontab) uses the tokens; agents are told never to read them, and `post` only
 writes a request to the outbox, which `sync` checks against slack.conf before anything reaches Slack. The
@@ -16,7 +17,7 @@ Mirrors go to /srv/projects/<project>/data/slack/<workspace>/<channel>/ (outside
   messages.json   raw messages and thread replies
   files/          attachments
 """
-import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.parse, urllib.request
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,9 @@ LAB = Path("/srv/lab")
 CONF = LAB / "slack.conf"
 STATE = LAB / "state" / "slack"
 OUTBOX = STATE / "outbox"
+APPROVED = STATE / "approved"   # posts the PI approved in Slack (written only by hpc's listener)
+OFFERED = STATE / "offered"     # attachments of summaries offered to the PI, kept until they decide
+SUMMARY_OFFERS = STATE / "summary-offers.json"  # DM prompt ts -> offer (see deliver)
 PROJECTS = Path("/srv/projects")
 LAB_CONF = Path("/etc/agentbox/lab.conf")
 
@@ -45,6 +49,8 @@ PI = lab_conf("PI_GITHUB")              # the PI's GitHub handle: only their com
 BOT = lab_conf("SLACK_BOT_NAME", "lab-bot")   # the Slack app's display name, for messages
 PI_SLACK = {}                           # workspace -> the PI's Slack user id, from `pi` lines in slack.conf
 MAX_POST = 3000
+ATTACH_TYPES = {".pdf", ".png"}
+MAX_ATTACH = 20 << 20
 
 
 def die(msg):
@@ -89,6 +95,11 @@ def parse_conf():
     for c in chans:
         if c["workspace"] not in ws:
             die(f"slack.conf: channel {c['name']} names unknown workspace {c['workspace']}.")
+    for w in ws:  # the director may always message the PI directly; never mirrored
+        if w in PI_SLACK:
+            chans.append(dict(workspace=w, name="@pi", mode="post", projects=[], posters=["director"],
+                              every=float("inf"), per_hour=10, dm=PI_SLACK[w]))
+            chans[-1]["posters"].append("lead")  # leads only offer summaries (--then), see check_request
     return ws, chans, people
 
 
@@ -151,6 +162,12 @@ class Slack:
         with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)
+
+
+def channel_ref(slack, c, states):
+    if c.get("dm"):
+        return slack.call("conversations.open", post=True, users=c["dm"])["channel"]["id"]
+    return states[(c["workspace"], c["name"])].get("id") or channel_id(slack, c["name"])
 
 
 def channel_id(slack, name):
@@ -245,7 +262,20 @@ def mirror(slack, c, people, state):
                 parts.append(render(r, indent="    "))
         write_atomic(out / "channel.md", "\n".join(parts))
         write_atomic(out / "messages.json", json.dumps(dict(messages=msgs, replies=cache), indent=1))
+        if project_account(p) != "hpc":   # its agents run as another account (group agents): let them read this
+            for d, _, fs in os.walk(root / "slack"):   # project's own mirror only, never lab-slack's state
+                os.chmod(d, 0o2750)
+                for f in fs:
+                    os.chmod(Path(d) / f, 0o640)
     return len(msgs)
+
+
+def project_account(p):
+    try:
+        reg = json.load(open(LAB / "registry.json"))
+        return (reg.get("projects", reg).get(p) or {}).get("account", "hpc")
+    except Exception:
+        return "hpc"
 
 
 # --- posting
@@ -263,18 +293,91 @@ def posts_last_hour(c):
                if (f := l.split("\t")) and float(f[0]) > cut and f[1] == f"{c['workspace']}/{c['name']}")
 
 
+def upload(slack, c, req, text):
+    """Post text with the request's attachment (Slack's external-upload flow; needs the files:write scope)."""
+    a = req["attach"]
+    data = Path(a.get("path") or OUTBOX / a["copy"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != a["sha256"]:
+        raise RuntimeError("attachment changed since it was queued")
+    up = slack.call("files.getUploadURLExternal", post=True, filename=a["name"], length=len(data))
+    with urllib.request.urlopen(urllib.request.Request(up["upload_url"], data=data), timeout=300) as r:
+        r.read()
+    extra = {"thread_ts": req["thread"]} if req.get("thread") else {}
+    slack.call("files.completeUploadExternal", post=True, files=json.dumps([{"id": up["file_id"], "title": a["name"]}]),
+               channel_id=c["id"], initial_comment=text, **extra)
+    return up["file_id"], upload_ts(slack, c, up["file_id"])
+
+
+def upload_ts(slack, c, file_id, tries=10):
+    """The ts of the message that carries an uploaded file (Slack shares it asynchronously), or None."""
+    for _ in range(tries):
+        try:
+            shares = slack.call("files.info", file=file_id).get("file", {}).get("shares", {})
+            for kind in ("private", "public"):
+                if (s := shares.get(kind, {}).get(c["id"])):
+                    return s[0]["ts"]
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+
 def deliver(slack, c, req, why):
     text = req["text"].rstrip() + f"\n— lab (agent), {req['project']} {req['role']}"
-    extra = {"thread_ts": req["thread"]} if req.get("thread") else {}
-    out = slack.call("chat.postMessage", post=True, channel=c["id"], text=text, unfurl_links="false", **extra)
+    msg_ts = None
+    if req.get("attach"):
+        ts, msg_ts = upload(slack, c, req, text)
+    else:
+        extra = {"thread_ts": req["thread"]} if req.get("thread") else {}
+        ts = msg_ts = slack.call("chat.postMessage", post=True, channel=c["id"], text=text, unfurl_links="false",
+                                 **extra).get("ts")
     with open(STATE / "posts.tsv", "a") as f:
-        f.write(f"{time.time():.0f}\t{c['workspace']}/{c['name']}\t{req['project']}\t{req['role']}\t{out.get('ts')}\t{why}\n")
-    return out.get("ts")
+        f.write(f"{time.time():.0f}\t{c['workspace']}/{c['name']}\t{req['project']}\t{req['role']}\t{ts}\t{why}\n")
+    if c.get("dm") and req.get("issue"):
+        offer(slack, c, req, req.get("thread") or msg_ts)
+    return ts
 
 
-def check_request(req, chans):
+def offer(slack, c, req, root=None):
+    """After a summary reaches the PI's DM: ask them whether to share it in req["then"], as a reply in the summary's
+    own thread (root), so one summary and its revisions live in one thread. Their reply anywhere in
+    that thread is handled by lab-slack-listen (post / no / comments relayed to req["issue"]) and acts on the
+    newest version; older offers in the thread are marked superseded."""
+    OFFERED.mkdir(mode=0o700, exist_ok=True)
+    a = dict(req["attach"])
+    a["path"] = str(OFFERED / a["copy"])
+    shutil.copyfile(OUTBOX / a["copy"], a["path"])
+    if req.get("then"):
+        ask = (f"Share this {req['project']} summary in #{req['then'].split('/', 1)[1]}? Reply in this thread: `post` to "
+               f"share it as is, `no` to drop it; anything else goes to the writer as your comments (on {req['issue']}).")
+    else:
+        ask = (f"{req['project']} has no Slack channel for summaries, so this one stays in the repo. Reply in this "
+               f"thread with any comments for the writer (they go on {req['issue']}).")
+    msg = slack.call("chat.postMessage", post=True, channel=c["id"], text=ask, **({"thread_ts": root} if root else {}))
+    offers = read_json(SUMMARY_OFFERS, {})
+    for o in offers.values():
+        if root and o.get("thread") == root and o["status"] in ("open", "comments"):
+            o["status"] = "superseded"
+    offers[msg["ts"]] = dict(time=time.time(), dm=c["id"], project=req["project"], role=req["role"], then=req.get("then"),
+                             issue=req["issue"], text=req["text"], attach=a, status="open", thread=root)
+    write_atomic(SUMMARY_OFFERS, json.dumps(offers, indent=1))
+
+
+def check_request(req, chans, approved=False):
     c = find_channel(chans, req["channel"])
-    if req["project"] not in c["projects"]:
+    if req.get("then") and not c.get("dm"):
+        return c, "--then is only for posts to <workspace>/@pi"
+    if c.get("dm") and req["role"] != "director" and not (req.get("attach") and req.get("issue")):
+        return c, "only the director messages the PI; a lead sends them a summary (--attach and --issue)"
+    if req.get("then"):
+        t = find_channel(chans, req["then"])
+        if req["project"] not in t["projects"] or t["mode"] == "read" or t.get("dm"):
+            return c, f"{req['then']} isn't a channel {req['project']} may post in"
+    if approved:  # the PI approved this exact post in Slack: only the channel itself is checked
+        if req["project"] not in c["projects"] or c["mode"] == "read":
+            return c, f"{req['channel']} no longer takes posts from {req['project']}"
+        return c, None
+    if req["project"] not in c["projects"] and not c.get("dm"):
         return c, f"project {req['project']} isn't allowed in {req['channel']}"
     if c["mode"] == "read":
         return c, f"{req['channel']} is read-only"
@@ -291,9 +394,32 @@ def draft_hash(req):
     """What the PI approves: channel, thread and text. Delivery compares it again, so an outbox file edited
     after the draft issue was opened is refused rather than posted under the approval."""
     return hashlib.sha256(json.dumps([req.get("channel"), req.get("thread"), req["text"]]).encode()).hexdigest()
+def handle_approved(chans, clients, states):
+    for f in sorted(APPROVED.glob("*.json")) if APPROVED.exists() else []:
+        req = read_json(f, None)
+        if not req:
+            continue
+        c, bad = check_request(req, chans, approved=True)
+        if not bad and c["workspace"] not in clients:
+            continue
+        if bad:
+            req["status"] = f"refused: {bad}"
+        else:
+            c["id"] = channel_ref(clients[c["workspace"]], c, states)
+            try:
+                req["status"] = f"posted {deliver(clients[c['workspace']], c, req, 'approved by the PI in Slack')}"
+            except RuntimeError as e:
+                req["status"] = f"failed: {e}"
+        (STATE / "sent").mkdir(exist_ok=True)
+        write_atomic(STATE / "sent" / f.name, json.dumps(req))
+        f.unlink()
+        if req.get("attach"):
+            Path(req["attach"]["path"]).unlink(missing_ok=True)
+        print(f"{f.name}: {req['status']}")
 
 
 def handle_outbox(ws, chans, clients, states):
+    handle_approved(chans, clients, states)
     for f in sorted(OUTBOX.glob("*.json")):
         req = read_json(f, None)
         if not req:
@@ -308,6 +434,7 @@ def handle_outbox(ws, chans, clients, states):
                    "--title", f"Slack draft for #{c['name']} from {req['project']} {req['role']}",
                    "--body", f"lab-slack draft (request `{f.name}`) for **{req['channel']}**:\n\n"
                              + "\n".join("> " + l for l in req["text"].splitlines())
+                             + (f"\n\nWith the file `{req['attach']['source']}` (sha256 {req['attach']['sha256'][:12]}…)." if req.get("attach") else "")
                              + "\n\nComment `approve` to post it as is, or `cancel`. Only comments from @" + PI + " count."
                              + f"\n\n<sub>sha256 `{draft_hash(req)}`</sub>")
             if r.returncode:
@@ -332,7 +459,7 @@ def handle_outbox(ws, chans, clients, states):
                 gh("issue", "comment", num, "-R", f"{ORG}/lab", "--body",
                    "lab-slack: not posted, because the text no longer matches what this issue shows.")
             elif re.match(r"(approve|approved)\b", last):
-                c["id"] = states[(c["workspace"], c["name"])].get("id") or channel_id(clients[c["workspace"]], c["name"])
+                c["id"] = channel_ref(clients[c["workspace"]], c, states)
                 ts = deliver(clients[c["workspace"]], c, req, "approved draft")
                 req["status"] = f"posted {ts}"
                 gh("issue", "close", num, "-R", f"{ORG}/lab", "--comment", "lab-slack: posted.")
@@ -341,13 +468,18 @@ def handle_outbox(ws, chans, clients, states):
         elif posts_last_hour(c) >= c["per_hour"]:
             continue  # over the channel's rate; wait
         else:
-            c["id"] = states[(c["workspace"], c["name"])].get("id") or channel_id(clients[c["workspace"]], c["name"])
-            ts = deliver(clients[c["workspace"]], c, req, "post mode")
-            req["status"] = f"posted {ts}"
+            c["id"] = channel_ref(clients[c["workspace"]], c, states)
+            try:
+                ts = deliver(clients[c["workspace"]], c, req, "post mode")
+                req["status"] = f"posted {ts}"
+            except RuntimeError as e:
+                req["status"] = f"failed: {e}"
         done = STATE / "sent"
         done.mkdir(exist_ok=True)
         write_atomic(done / f.name, json.dumps(req))
         f.unlink()
+        if req.get("attach"):
+            (OUTBOX / req["attach"]["copy"]).unlink(missing_ok=True)
         print(f"{f.name}: {req['status']}")
 
 
@@ -375,7 +507,7 @@ def cmd_sync(args):
         key = f"{c['workspace']}/{c['name']}"
         st = allstate.setdefault(key, {})
         states[(c["workspace"], c["name"])] = st
-        if c["workspace"] not in clients:
+        if c["workspace"] not in clients or c.get("dm"):
             continue
         if not args.force and time.time() - st.get("synced", 0) < c["every"]:
             continue
@@ -403,14 +535,51 @@ def cmd_post(args):
         die("--thread is the parent message's ts, e.g. 1792874200.384259.")
     req = dict(time=time.time(), project=args.project, role=args.role, channel=args.channel, text=text,
                user=os.environ.get("USER", ""), thread=args.thread)
+    # issue and attach are checked with or without --then (summaries of projects with no channel too)
+    req.update(issue=args.issue, attach=bool(args.attach))  # attach filled in below
+    if args.then:
+        req["then"] = args.then
     c, bad = check_request(req, chans)
+    if c.get("dm") and args.issue and not args.thread:
+        req["thread"] = summary_thread(args.project, args.issue, args.attach)
     if bad:
         die(f"Not allowed: {bad}.")
     OUTBOX.mkdir(parents=True, exist_ok=True)
     name = f"{time.time_ns()}-{args.project}-{os.getpid()}.json"
+    if args.attach:
+        src, root = Path(args.attach), (PROJECTS / args.project).resolve()
+        if src.is_symlink() or not src.is_file():
+            die("--attach must be a regular file, not a link.")
+        real = src.resolve()
+        if root not in real.parents:
+            die(f"--attach must be inside {root}/.")
+        if real.suffix.lower() not in ATTACH_TYPES:
+            die(f"--attach takes {', '.join(sorted(ATTACH_TYPES))} files.")
+        data = real.read_bytes()
+        if len(data) > MAX_ATTACH:
+            die(f"--attach is over {MAX_ATTACH >> 20} MB; link to GitHub instead.")
+        copy = name[:-5] + real.suffix.lower()  # a copy, so what goes out is what was queued
+        (OUTBOX / copy).write_bytes(data)
+        req["attach"] = dict(name=real.name, copy=copy, sha256=hashlib.sha256(data).hexdigest(), source=str(real))
     write_atomic(OUTBOX / name, json.dumps(req))
     print(f"Queued for {args.channel} ({c['mode']} mode): "
           + ("the PI approves it in their inbox first." if c["mode"] == "draft" else "it goes out at the next sync."))
+
+
+def summary_key(name):
+    m = re.search(r"\d{4}-\d\d-\d\d-(am|pm)", name or "")
+    return m and m.group(0)
+
+
+def summary_thread(project, issue, attach):
+    """A revised summary goes in the thread of the earlier version and the PI's comments: the newest offer
+    of the same summary (same issue, same YYYY-MM-DD-am|pm in the file name) that is still open or has comments."""
+    key, best = summary_key(Path(attach).name if attach else ""), None
+    for o in read_json(SUMMARY_OFFERS, {}).values():
+        if (o["project"] == project and o["issue"] == issue and o.get("thread") and o["status"] in ("open", "comments")
+                and key and summary_key(o["attach"]["name"]) == key and (not best or o["time"] > best["time"])):
+            best = o
+    return best and best["thread"]
 
 
 def cmd_status(args):
@@ -436,6 +605,10 @@ def main():
     s.add_argument("--channel", required=True)
     s.add_argument("--thread", help="reply in the thread of this message ts instead of the channel")
     g = s.add_mutually_exclusive_group(required=True); g.add_argument("--file"); g.add_argument("--text")
+    s.add_argument("--attach", help="a .pdf or .png inside the project's folder, uploaded with the post")
+    s.add_argument("--then", help="with --channel <ws>/@pi: offer the post to the PI, then share it in this channel "
+                                  "if they reply `post`")
+    s.add_argument("--issue", help="with --then: the issue (URL) where the PI's comments on it are relayed")
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     a = ap.parse_args()
     a.fn(a)

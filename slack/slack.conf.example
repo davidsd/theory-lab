@@ -5,12 +5,20 @@
 #   The listener also needs the app-level token in ~/.config/lab/slack-<name>.apptoken.
 #
 # pi <workspace> <slack user id>       the PI's own Slack user (profile -> ... -> Copy member ID). Only this
-#   user may approve held cluster jobs by DM, and the PI's DMs reach the director.
+#   user may approve held cluster jobs by DM, and the PI's DMs reach the director. It also makes the
+#   pseudo-channel <workspace>/@pi: a DM to the PI, never mirrored, that only the director posts to, and that
+#   leads use only to send the PI their project summaries (lab-slack post --attach <pdf> --issue <summary issue>
+#   [--then <channel>]). The PI answers a summary in its DM thread: `post` (or "yes, post it") shares it in
+#   the --then channel, `no` drops it, anything else goes to the summary issue as the PI's comments. Which
+#   channel each project's summaries go to is written in LAB-RULES.md ("Project summaries"); --then must be a
+#   channel below that lists the project, in draft or post mode.
 #
 # channel <workspace> <channel> projects=<p1,p2> mode=read|draft|post [posters=lead,worker] [every=6h] [per_hour=4]
 #   The app must also be invited to the channel (/invite @<bot>). Its history is mirrored only into the
 #   listed projects' data/slack/ (outside git). read: no posting. draft: posts go to the PI's inbox for
-#   approval first. post: posts go out directly, signed, logged, rate-limited.
+#   approval first. post: posts go out directly, signed, logged, rate-limited. The mirror of a project on the
+#   agent account is made readable by group agents (that project's folder only), so its agents can read it.
+#   Posting a file (--attach) needs the bot scope files:write (slack/manifest.yaml has it).
 #
 # Mentions and direct messages (lab-slack-listen) are answered in any channel listed here, whatever its mode:
 #   a mention is someone asking. Channels not listed get no answers; an invite to one asks the PI.

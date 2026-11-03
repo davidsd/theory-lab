@@ -23,7 +23,7 @@ from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web import WebClient
 
-_loader = importlib.machinery.SourceFileLoader("labslack", "/usr/local/bin/lab-slack")
+_loader = importlib.machinery.SourceFileLoader("labslack", os.environ.get("LAB_SLACK", "/usr/local/bin/lab-slack"))   # LAB_SLACK: tests only
 ls = importlib.util.module_from_spec(importlib.util.spec_from_loader("labslack", _loader))
 _loader.exec_module(ls)
 
@@ -36,11 +36,12 @@ PER_HOUR = {"known": 60, "unknown": 20}  # answers per person per rolling hour
 MAX_REPLY = 3500
 pool = ThreadPoolExecutor(max_workers=2)
 lock = threading.Lock()
-seen, recent = set(), {}
+seen, recent, refused = set(), {}, {}
 APPS = {}   # workspace -> (app, cfg), for polling threads
 LEDGER = LAB / "state" / "hpc-ledger.tsv"
 OFFERS = STATE / "approval-dms.json"  # held HPC job -> [DM channel, message ts], or ["skip"]
 SMALL_JOB, SMALL_WAIT = 2000, 6 * 3600  # held jobs this small are offered to the PI only after this long
+QUEUED_WAIT = 12 * 3600  # a job queued for the daily limit (hpc-submit) reaches the PI only after this long
 PENDING = STATE / "pending-links.json"  # survives restarts: "<workspace> <slack user>" -> [identity, code, time]
 
 
@@ -181,8 +182,12 @@ def proof_found(identity, code):
 
 # --- runs
 
+RESPONDER_STOP_PERCENT = 98   # answer Slack even past the lab's own Claude stop percent (the runs are short)
+
+
 def claude_room():
-    return subprocess.run(["bash", "-c", f"source {LIB}; claude_room"]).returncode == 0
+    """Room for a responder run: under the lab's weekly run cap, and the plan under RESPONDER_STOP_PERCENT."""
+    return subprocess.run(["bash", "-c", f"source {LIB}; CLAUDE_LAB_STOP_PERCENT={RESPONDER_STOP_PERCENT}; claude_room"]).returncode == 0
 
 
 def claude_flags():
@@ -190,15 +195,18 @@ def claude_flags():
     return out.stdout.split("\n")[:-1] if out.stdout else []
 
 
-def readonly_flags(project):
+def readonly_flags(project, allowed=()):
     """For people who may not instruct the lab: read the project's files and board, nothing else. Their text
     reaches a model, so a hostile message must not be able to run commands or read tokens."""
     home = str(Path.home())
-    others = [p for p in json.loads((LAB / "registry.json").read_text()).get("projects", {}) if p != project]
+    reg = json.loads((LAB / "registry.json").read_text())
+    reg = reg.get("projects", reg)
+    keep = {project, *allowed}   # every project the channel (or the person) is connected to
+    others = [p for p in reg if p not in keep]
     deny = [f"{t}({path})" for t in ("Read", "Grep", "Glob")
             for path in [f"/{home}/**", "//etc/**", "//tmp/**", "//root/**", f"/{LAB}/**", "//srv/agents/**",
                          *[f"/{PROJECTS}/{o}/**" for o in others],
-                         f"/{PROJECTS}/{project}/data/slack/**"]]
+                         *[f"/{PROJECTS}/{p}/data/slack/**" for p in keep]]]
     deny += [f"{t}(//proc/**)" for t in ("Read", "Grep", "Glob")]
     # no user/project settings: their allow rules (lab-rm, the cancel tools) and hooks must not apply here.
     # gh runs in the project's clone, so it reads that repo's board; other repos (-R/--repo) are refused.
@@ -208,10 +216,10 @@ def readonly_flags(project):
             "Bash(/usr/local/bin/*)", "Bash(lab-rm:*)", "Bash(lab-cancel:*)", "Bash(hpc-cancel:*)", "Bash(hpc-submit:*)"]
 
 
-def respond(prompt, cwd, project, readonly=True):
+def respond(prompt, cwd, project, readonly=True, allowed=()):
     RUNS.mkdir(parents=True, exist_ok=True)
     logf = RUNS / f"{time.strftime('%Y%m%d-%H%M%S')}-{project}.json"
-    mode = readonly_flags(project) if readonly else ["--permission-mode", "auto"]
+    mode = readonly_flags(project, allowed) if readonly else ["--permission-mode", "auto"]
     with open(logf, "w") as f:
         subprocess.run(["claude", "-p", prompt, *mode, "--output-format", "json", *claude_flags()],
                        cwd=cwd, stdout=f, stderr=subprocess.DEVNULL, timeout=1200)
@@ -311,62 +319,36 @@ def decide(job, decision):
     return reply
 
 
-def lab_conf():
-    conf = {}
-    for line in open("/etc/agentbox/lab.conf"):
-        m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(\d+)\s*(#.*)?$", line)
-        if m:
-            conf[m[1]] = int(m[2])
-    return conf
-
-
 def release_if_fits():
-    """Release jobs held only for the daily limit once they fit every limit again, as hpc-submit
-    would have (small jobs shouldn't need the PI). Returns the jobs released."""
-    import fcntl, datetime
-    conf, done = lab_conf(), []
-    reg = json.loads((LAB / "registry.json").read_text()).get("projects", {})
-    with open(LAB / "state" / "ledger.lock", "a") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        rows = [l.split("\t") for l in LEDGER.read_text().splitlines() if l.count("\t") >= 12]
-        now = time.time()
-        month0 = datetime.datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
-        used = lambda t, p=None: sum(int(f[9] or 0) for f in rows if int(f[0]) >= t
-                                     and f[10] in ("auto", "approved") and (p is None or f[2] == p))
-        offers = ls.read_json(OFFERS, {})
-        for f in rows:
-            if (f[10] != "held" or not re.fullmatch(r"[0-9]+", f[4]) or offers.get(f[4], [""])[0] == "skip"
-                    or not issue_open(f[12])):
-                continue
-            body = subprocess.run(["gh", "issue", "view", f[12], "--json", "body", "--jq", ".body"],
-                                  capture_output=True, text=True, timeout=60).stdout
-            if "Held because over the lab's daily limit" not in body:
-                continue        # per-job, monthly, budget, arrays, GPU: those stay the PI's
-            sus, budget = int(f[9]), reg.get(f[2], {}).get("hpc_sus_month")
-            if (sus > conf.get("HPC_AUTO_SUS_PER_JOB", 0)
-                    or used(now - 86400) + sus > conf.get("HPC_AUTO_SUS_PER_DAY", 0)
-                    or used(month0) + sus > conf.get("HPC_LAB_SUS_PER_MONTH", 0)
-                    or (budget and used(month0, f[2]) + sus > int(budget))):
-                continue
-            if subprocess.run(["hpc-check"], capture_output=True, timeout=60).returncode:
-                break
-            if subprocess.run(["ssh", "-n", "cluster", f"scontrol release {f[4]}"],
-                              capture_output=True, timeout=120).returncode:
-                continue
-            f[10] = "auto"
-            done.append(f)
-        if done:
-            tmp = LEDGER.with_suffix(".tsv.tmp")
-            tmp.write_text("\n".join("\t".join(f) for f in rows) + "\n")
-            os.chmod(tmp, 0o644)
-            tmp.replace(LEDGER)
-    for f in done:
-        subprocess.run(["gh", "issue", "comment", f[12], "--body",
-                        f"Released HPC job {f[4]} automatically: it now fits the daily limit and every other "
-                        "limit, so it is within the budget the PI set and needs no approval."], capture_output=True, timeout=60)
-        subprocess.run(["gh", "issue", "close", f[12]], capture_output=True, timeout=60)
-        log("auto-released", f[4])
-    return [f[4] for f in done]
+    """Release jobs held only for the daily limit once they fit every limit again (hpc-release-queued, which the
+    watchdog also runs)."""
+    subprocess.run(["hpc-release-queued"], capture_output=True, timeout=600)
+
+
+SETTINGS_RESULTS = Path("/var/lib/lab-settings/results.jsonl")   # written by root's lab-settings-apply
+SETTINGS_DMED = STATE / "settings-dmed.json"
+
+
+def post_settings_results(web, ws):
+    """Tell the PI in their DM what lab-settings-apply did (the watchdog posts the same on the settings issue)."""
+    uid = ls.PI_SLACK.get(ws)
+    if not uid or not SETTINGS_RESULTS.exists():
+        return
+    posted = ls.read_json(SETTINGS_DMED, [])
+    for line in SETTINGS_RESULTS.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        tag = f"{ws}:{r.get('proposal')}:{r.get('time')}"
+        if tag in posted:
+            continue
+        what = (f"{r['proposal']} {r['result']}: `{r['key']}` {r['frm'] or '(unset)'} → {r['to']}" if r.get("result") == "applied"
+                else f"{r['proposal']} {r['result']}")
+        dm = web.conversations_open(users=uid)["channel"]["id"]
+        web.chat_postMessage(channel=dm, text=f"Settings: {what}.")
+        posted.append(tag)
+        ls.write_atomic(SETTINGS_DMED, json.dumps(posted))
 
 
 def offer_held(web, ws):
@@ -384,6 +366,10 @@ def offer_held(web, ws):
         if not issue_open(f[12]):        # withdrawn by its worker
             offers[job] = ["skip"]
             continue
+        if time.time() - int(f[0]) < QUEUED_WAIT and "queued for the daily limit" in subprocess.run(
+                ["gh", "issue", "view", f[12], "--json", "title", "--jq", ".title"],
+                capture_output=True, text=True, timeout=60).stdout:
+            continue        # held only by the daily limit: release_if_fits frees it; tell the PI only if it waits long
         dm = web.conversations_open(users=uid)["channel"]["id"]
         r = web.chat_postMessage(channel=dm, text=(
             f"*HPC job {job} is on hold for you* (~{f[9]} SUs): {f[2]} #{f[3]}, {f[11]}. "
@@ -399,6 +385,49 @@ def offer_held(web, ws):
                 pass
             offers[job] = o + ["done"]
     ls.write_atomic(OFFERS, json.dumps(offers))
+
+
+def summary_offer(offers, tt):
+    """The offer the PI answers by writing in thread tt: the newest open (or commented) one whose prompt is tt or
+    whose summary thread is tt (they may reply under the PDF or under the prompt)."""
+    live = [o for k, o in offers.items() if (k == tt or o.get("thread") == tt) and o["status"] in ("open", "comments")]
+    return max(live, key=lambda o: o["time"], default=None)
+
+
+def summary_answer(o, text, ts):
+    """Act on the PI's reply to a summary offer; o is updated in place. Returns the reply for the thread."""
+    word = text.lower().strip("`.!* ")
+    # "post", "post it", "post to #channel", "yes, post": a short reply that starts with or is a yes counts as yes
+    chan = (o.get("then") or "/").split("/", 1)[1].lower()
+    toks = re.findall(r"[#\w-]+", word)
+    if toks and toks[0] in ("ok", "yes", "sure"):
+        toks = toks[1:]
+    if toks and toks[0] in ("post", "share") and all(
+            t in ("it", "this", "now", "please", "to", "in", "on", "the", "channel") or t.lstrip("#") == chan for t in toks[1:]):
+        word = "post"
+    if word in ("post", "yes", "share", "approve", "approved") and not o.get("then"):
+        return "This project has no Slack channel for summaries; tell the director which channel it should use."
+    if word in ("post", "yes", "share", "approve", "approved"):
+        ls.APPROVED.mkdir(mode=0o700, exist_ok=True)
+        req = dict(time=time.time(), project=o["project"], role=o["role"], channel=o["then"], text=o["text"],
+                   attach=o["attach"], approved=f"the PI in Slack, DM thread {ts}")
+        ls.write_atomic(ls.APPROVED / f"{time.time_ns()}-{o['project']}.json", json.dumps(req))
+        o["status"] = "approved"
+        log("summary approved", o["project"], o["then"])
+        return f"OK: it goes to #{o['then'].split('/', 1)[1]} at the next sync (within 10 minutes)."
+    if word in ("no", "drop", "skip", "don't post", "dont post"):
+        Path(o["attach"]["path"]).unlink(missing_ok=True)
+        o["status"] = "dropped"
+        log("summary dropped", o["project"])
+        return "OK: not shared."
+    r = subprocess.run(["gh", "issue", "comment", o["issue"], "--body",
+                        f"From the PI (via Slack, relayed by the lab), on the summary `{o['attach']['name']}`:\n\n"
+                        + "\n".join("> " + l for l in text.splitlines())], capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        return "I couldn't put that on the issue; please try again in a minute."
+    o["status"] = "comments"
+    log("summary comments", o["project"])
+    return f"Passed to the writer on {o['issue']}. The revised version will come here again."
 
 
 def handle(app, ws, ev, cfg):
@@ -417,7 +446,19 @@ def handle(app, ws, ev, cfg):
     except Exception:
         name = uid
     ids = identities(ws, uid, name, people_conf)
-    say = lambda t: web.chat_postMessage(channel=ch, thread_ts=None if is_dm else thread_ts, text=t[:MAX_REPLY * 3])
+    reply_ts = ev.get("thread_ts") if is_dm else thread_ts   # in a DM, answer in the thread the PI wrote in
+    say = lambda t: web.chat_postMessage(channel=ch, thread_ts=reply_ts, text=t[:MAX_REPLY * 3])
+
+    # The PI's answer to a project summary offered in their DM (lab-slack post --then): post / no / comments
+    if is_dm and uid == ls.PI_SLACK.get(ws) and ev.get("thread_ts"):
+        with lock:
+            offers = ls.read_json(ls.SUMMARY_OFFERS, {})
+            o = summary_offer(offers, ev["thread_ts"])
+            if o:
+                reply = summary_answer(o, text, ev["thread_ts"])
+                ls.write_atomic(ls.SUMMARY_OFFERS, json.dumps(offers, indent=1))
+                web.chat_postMessage(channel=ch, thread_ts=ev["thread_ts"], text=reply)
+                return
 
     # The PI's answers to held HPC jobs (only their own Slack user, only in a DM)
     m = re.fullmatch(r"(?i)\W*(approve|approved|cancel|cancelled)\W*(\d+|all)?\W*", text) \
@@ -517,19 +558,31 @@ def handle(app, ws, ev, cfg):
 
     instructor = PI in ids or bool(ids & set().union(*[agents_people(p) for p in authority_projects] or [set()]))
     kind = "known" if (ids or instructor) else "unknown"
+
+    def refuse(reason, text):
+        """Say why the bot can't answer, at most once per thread per reason every 6 h; never for a reply that
+        didn't mention the bot (people talking in a thread the bot is in shouldn't get a refusal each time)."""
+        key = (ws, ch, thread_ts, reason)
+        if ev.get("unmentioned") or time.time() - refused.get(key, 0) < 6 * 3600:
+            log("not answering", reason, ws, ch, uid)
+            return
+        refused[key] = time.time()
+        say(text)
+
     with lock:
         times = [t for t in recent.get((ws, uid), []) if t > time.time() - 3600]
         if len(times) >= PER_HOUR[kind]:
             wait = max(1, int((min(times) + 3600 - time.time()) / 60) + 1)
             link = "" if kind == "known" else (" People whose Slack is linked to their GitHub or GitLab handle get "
                                                f"{PER_HOUR['known']}: DM me `link github <handle>` or `link gitlab <handle>`.")
-            say(f"I've reached my limit for you: I answer at most {PER_HOUR[kind]} questions per person per hour, "
+            refuse("rate", f"I've reached my limit for you: I answer at most {PER_HOUR[kind]} questions per person per hour, "
                 f"to keep the lab's Claude use in check. Your next answer is possible in about {wait} min.{link} "
                 "Or ask on GitHub.")
             return
         recent[(ws, uid)] = times + [time.time()]
     if not claude_room():
-        say("The lab's Claude allowance for this week is used up, so I can't answer now. Please ask on GitHub.")
+        refuse("allowance", "The lab's Claude allowance for this week is used up, so I can't answer in Slack until it "
+               "resets; I won't repeat this in this thread. Please ask on GitHub meanwhile.")
         return
 
     thread = ""
@@ -561,14 +614,15 @@ def handle(app, ws, ev, cfg):
                            ident=", ".join(sorted(ids)) or "not linked to any GitHub or GitLab account",
                            authority=authority, act=act, limit=limit, org=ORG, max=MAX_REPLY)
     try:
-        reply = respond(prompt, cwd, project, readonly=not instructor) or "Sorry, I couldn't put an answer together. Please ask on GitHub."
+        reply = respond(prompt, cwd, project, readonly=not instructor, allowed=authority_projects) or "Sorry, I couldn't put an answer together. Please ask on GitHub."
     except subprocess.TimeoutExpired:
         reply = "That took too long to answer here; please ask on the project's GitHub board."
     if ev.get("unmentioned") and reply.strip().strip("`*.").upper() == "NOREPLY":
         log("not addressed to the lab", ws, ch, uid, project)
         return
     for part in chunks(reply):
-        out = web.chat_postMessage(channel=ch, thread_ts=None if is_dm else thread_ts, text=part, unfurl_links=False)
+        out = web.chat_postMessage(channel=ch, thread_ts=ev.get("thread_ts") if is_dm else thread_ts, text=part,
+                                   unfurl_links=False)
     with open(STATE / "posts.tsv", "a") as f:
         f.write(f"{time.time():.0f}\t{ws}/{'dm' if is_dm else cfg['names'].get(ch, ch)}\t{project}\tresponder\t{out.get('ts')}\treply to {uid}\n")
     log("answered", ws, ch, uid, project)
@@ -626,6 +680,33 @@ def poll_threads(ws):
     ls.write_atomic(THREAD_SEEN, json.dumps({k: v for k, v in done.items() if float(v) > cutoff}, indent=1))
 
 
+REPLAY = STATE / "replay.json"   # [{"ws", "channel", "ts", "thread_ts"}]: messages to answer as if just mentioned
+
+
+def replay(ws):
+    """Answer queued messages (e.g. ones refused while the Claude allowance was used up). The director adds
+    entries; the bot token stays in this process."""
+    app, cfg = APPS[ws]
+    with lock:
+        queue = ls.read_json(REPLAY, [])
+        mine = [q for q in queue if q.get("ws") == ws]
+        if not mine:
+            return
+        ls.write_atomic(REPLAY, json.dumps([q for q in queue if q.get("ws") != ws], indent=1))
+    for q in mine:
+        try:
+            msgs = app["web"].conversations_replies(channel=q["channel"], ts=q.get("thread_ts") or q["ts"], limit=200)["messages"]
+            m = next(m for m in msgs if m["ts"] == q["ts"])
+        except Exception as e:
+            log("replay failed", ws, q, repr(e))
+            continue
+        ev = dict(m, channel=q["channel"], channel_type="channel")
+        if q.get("thread_ts"):
+            ev["thread_ts"] = q["thread_ts"]
+        log("replaying", ws, q["channel"], q["ts"])
+        pool.submit(lambda ev=ev: _safe(handle, app, ws, ev, cfg))
+
+
 def on_join(app, ws, ev, cfg):
     if ev.get("user") != app["bot_user"]:
         return
@@ -642,7 +723,7 @@ def on_join(app, ws, ev, cfg):
     body = (f"The Slack bot was invited to **#{info.get('name')}** in workspace `{ws}` (by Slack user {inviter}). "
             "It isn't in /srv/lab/slack.conf, so the lab ignores it for now. Reply with the projects it belongs to "
             "and the mode (read, draft or post), and the director adds the line. Default: ignore it.")
-    subprocess.run(["gh", "issue", "create", "-R", f"{ORG}/lab", "--label", "inbox,ask", "--assignee", ls.PI,
+    subprocess.run(["gh", "issue", "create", "-R", f"{ORG}/lab", "--label", "inbox,ask",
                     "--title", f"Slack: the bot was invited to #{info.get('name')}", "--body", body],
                    capture_output=True, timeout=60)
     log("invited to unlisted channel", ws, info.get("name"))
@@ -699,8 +780,10 @@ def main():
     while True:
         for w, info in ws_conf.items():
             _safe(offer_held, WebClient(token=Path(info["token"]).read_text().strip()), w)
+            _safe(post_settings_results, WebClient(token=Path(info["token"]).read_text().strip()), w)
             if w in APPS:
                 _safe(poll_threads, w)
+                _safe(replay, w)
         time.sleep(60)
         if len(seen) > 5000:
             seen.clear()
