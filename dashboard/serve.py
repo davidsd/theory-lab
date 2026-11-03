@@ -1021,7 +1021,9 @@ def scratch_sample():
     if not cmds:
         return
     out = subprocess.run(["ssh", "-n", "cluster", "; ".join(cmds)], capture_output=True, text=True, timeout=120).stdout
-    nums = [l.split() for l in out.splitlines() if l.strip() and l.split()[0].rstrip("*").isdigit()]
+    # lfs prints the filesystem and the numbers on one line, or on two when the name is long: drop the name.
+    rows = [l.split()[1:] if l.split()[:1] == [fs] else l.split() for l in out.splitlines()]
+    nums = [r for r in rows if r and r[0].rstrip("*").isdigit()]
     if len(nums) < len(cmds):   # kbytes used, quota, limit, (grace), files ...; a '*' marks over a limit
         return
     rec = dict(time=time.time())
