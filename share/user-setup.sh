@@ -2,6 +2,8 @@
 # Per-account setup, run once as each agent account:
 #   bash /usr/local/share/agentbox/user-setup.sh             # as agent
 #   bash /usr/local/share/agentbox/user-setup.sh --hpc   # as hpc: also the HPC connection
+#   bash /usr/local/share/agentbox/user-setup.sh --codex-api   # only: log this account's Codex in to the OpenAI
+#                                                             # API in ~/.codex-api (CODEX_API, lab spawn --api)
 # Installs Claude Code, Codex and uv, a Python environment with common scientific packages, Claude
 # hooks that report each session's state, the lab rules for every agent, and the GitHub login
 # (it asks for the agents' GitHub token).
@@ -11,6 +13,21 @@ share=/usr/local/share/agentbox
 with_hpc=false
 [[ ${1:-} == --hpc ]] && with_hpc=true
 export PATH="$HOME/.local/bin:$PATH"
+
+if [[ ${1:-} == --codex-api ]]; then
+  # A second Codex home for API runs: the plan's login stays in ~/.codex, the API key's in ~/.codex-api.
+  # lib.sh uses it for runs marked LAB_CODEX_API (overflow, or lab spawn --api) while the lab's budget lasts.
+  install -d -m 700 ~/.codex-api
+  [[ -f ~/.codex-api/config.toml ]] || cp ~/.codex/config.toml ~/.codex-api/config.toml 2> /dev/null ||
+    cp "$share/config/codex-config.toml" ~/.codex-api/config.toml
+  ln -sf /srv/lab/LAB-RULES.md ~/.codex-api/AGENTS.md
+  read -rsp "Paste the OpenAI API key for the lab (it won't be shown): " key
+  echo
+  printf '%s' "$key" | CODEX_HOME=~/.codex-api codex login --with-api-key; unset key
+  CODEX_HOME=~/.codex-api codex login status
+  echo "Now set CODEX_API_BUDGET_USD in lab.conf (sudo) and fill in /srv/lab/codex-api-prices.tsv."
+  exit 0
+fi
 
 echo "== Claude Code"
 curl -fsSL https://claude.ai/install.sh | bash
