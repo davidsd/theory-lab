@@ -263,10 +263,17 @@ def mirror(slack, c, people, state):
         write_atomic(out / "channel.md", "\n".join(parts))
         write_atomic(out / "messages.json", json.dumps(dict(messages=msgs, replies=cache), indent=1))
         if project_account(p) != "hpc":   # its agents run as another account (group agents): let them read this
-            for d, _, fs in os.walk(root / "slack"):   # project's own mirror only, never lab-slack's state
-                os.chmod(d, 0o2750)
-                for f in fs:
-                    os.chmod(Path(d) / f, 0o640)
+            # That account owns the project folder, so never follow a link it may have planted (chmod follows
+            # links): only the project's own mirror, never lab-slack's state or anything else hpc owns.
+            top = root / "slack"
+            if not top.is_symlink():
+                for d, _, fs in os.walk(top):
+                    if os.path.islink(d):
+                        continue
+                    os.chmod(d, 0o2750)
+                    for f in fs:
+                        if not os.path.islink(Path(d) / f):
+                            os.chmod(Path(d) / f, 0o640)
     return len(msgs)
 
 
@@ -293,10 +300,22 @@ def posts_last_hour(c):
                if (f := l.split("\t")) and float(f[0]) > cut and f[1] == f"{c['workspace']}/{c['name']}")
 
 
-def upload(slack, c, req, text):
+ATTACH_NAME = re.compile(r"[0-9]+-[A-Za-z0-9_.-]+-[0-9]+\.(pdf|png)")
+
+
+def attach_file(a, base):
+    """The attachment's file in base (OUTBOX or OFFERED). Only the plain name cmd_post makes counts, never a path
+    from the request: outbox files are written by agents of either account, and sync runs as hpc."""
+    name = (a or {}).get("copy") or ""
+    if not ATTACH_NAME.fullmatch(name):
+        raise RuntimeError(f"bad attachment name {name!r}")
+    return base / name
+
+
+def upload(slack, c, req, text, base):
     """Post text with the request's attachment (Slack's external-upload flow; needs the files:write scope)."""
     a = req["attach"]
-    data = Path(a.get("path") or OUTBOX / a["copy"]).read_bytes()
+    data = attach_file(a, base).read_bytes()
     if hashlib.sha256(data).hexdigest() != a["sha256"]:
         raise RuntimeError("attachment changed since it was queued")
     up = slack.call("files.getUploadURLExternal", post=True, filename=a["name"], length=len(data))
@@ -322,11 +341,11 @@ def upload_ts(slack, c, file_id, tries=10):
     return None
 
 
-def deliver(slack, c, req, why):
+def deliver(slack, c, req, why, base=OUTBOX):
     text = req["text"].rstrip() + f"\n— lab (agent), {req['project']} {req['role']}"
     msg_ts = None
     if req.get("attach"):
-        ts, msg_ts = upload(slack, c, req, text)
+        ts, msg_ts = upload(slack, c, req, text, base)
     else:
         extra = {"thread_ts": req["thread"]} if req.get("thread") else {}
         ts = msg_ts = slack.call("chat.postMessage", post=True, channel=c["id"], text=text, unfurl_links="false",
@@ -345,8 +364,8 @@ def offer(slack, c, req, root=None):
     newest version; older offers in the thread are marked superseded."""
     OFFERED.mkdir(mode=0o700, exist_ok=True)
     a = dict(req["attach"])
-    a["path"] = str(OFFERED / a["copy"])
-    shutil.copyfile(OUTBOX / a["copy"], a["path"])
+    a["path"] = str(attach_file(a, OFFERED))
+    shutil.copyfile(attach_file(a, OUTBOX), a["path"])
     if req.get("then"):
         ask = (f"Share this {req['project']} summary in #{req['then'].split('/', 1)[1]}? Reply in this thread: `post` to "
                f"share it as is, `no` to drop it; anything else goes to the writer as your comments (on {req['issue']}).")
@@ -407,14 +426,17 @@ def handle_approved(chans, clients, states):
         else:
             c["id"] = channel_ref(clients[c["workspace"]], c, states)
             try:
-                req["status"] = f"posted {deliver(clients[c['workspace']], c, req, 'approved by the PI in Slack')}"
+                req["status"] = f"posted {deliver(clients[c['workspace']], c, req, 'approved by the PI in Slack', OFFERED)}"
             except RuntimeError as e:
                 req["status"] = f"failed: {e}"
         (STATE / "sent").mkdir(exist_ok=True)
         write_atomic(STATE / "sent" / f.name, json.dumps(req))
         f.unlink()
         if req.get("attach"):
-            Path(req["attach"]["path"]).unlink(missing_ok=True)
+            try:
+                attach_file(req["attach"], OFFERED).unlink(missing_ok=True)
+            except RuntimeError:
+                pass
         print(f"{f.name}: {req['status']}")
 
 
@@ -479,7 +501,10 @@ def handle_outbox(ws, chans, clients, states):
         write_atomic(done / f.name, json.dumps(req))
         f.unlink()
         if req.get("attach"):
-            (OUTBOX / req["attach"]["copy"]).unlink(missing_ok=True)
+            try:
+                attach_file(req["attach"], OUTBOX).unlink(missing_ok=True)
+            except RuntimeError:
+                pass
         print(f"{f.name}: {req['status']}")
 
 

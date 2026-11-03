@@ -127,6 +127,14 @@ class RequestTests(Tmp):
             self.assertNotEqual(ls.draft_hash(a), ls.draft_hash(dict(a, **{k: v})), k)
 
 
+class AttachNameTests(Tmp):
+    def test_only_plain_names_from_cmd_post(self):
+        self.assertEqual(ls.attach_file({"copy": "1700000000-proj-a-42.pdf"}, ls.OUTBOX), ls.OUTBOX / "1700000000-proj-a-42.pdf")
+        for bad in ("../../x.pdf", "1-a-2.pdf/../../y.pdf", "/etc/passwd", "1-a-2.sh", "", None):
+            with self.assertRaises(RuntimeError, msg=bad):
+                ls.attach_file({"copy": bad, "path": "/etc/passwd"}, ls.OUTBOX)
+
+
 class SummaryTests(Tmp):
     def offer(self, ts, status="open", thread="100.1", name="2026-01-30-am.pdf", t=1.0, then="ws/proj-a"):
         offers = ls.read_json(ls.SUMMARY_OFFERS, {})

@@ -416,7 +416,10 @@ def summary_answer(o, text, ts):
         log("summary approved", o["project"], o["then"])
         return f"OK: it goes to #{o['then'].split('/', 1)[1]} at the next sync (within 10 minutes)."
     if word in ("no", "drop", "skip", "don't post", "dont post"):
-        Path(o["attach"]["path"]).unlink(missing_ok=True)
+        try:
+            ls.attach_file(o["attach"], ls.OFFERED).unlink(missing_ok=True)
+        except RuntimeError:
+            pass
         o["status"] = "dropped"
         log("summary dropped", o["project"])
         return "OK: not shared."
