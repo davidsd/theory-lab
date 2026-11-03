@@ -20,7 +20,8 @@ def comment(n, login, body, edited=False):
 
 
 def proposal(n, pid, key, frm, to, login=BOT, edited=False):
-    return comment(n, login, f"**P{pid}: why**\n<!-- lab-setting P{pid} KEY={key} FROM={frm} TO={to} -->", edited)
+    return comment(n, login, f"**P{pid}: why**\n\n`{key}`: {frm or '(unset)'} → **{to}** (hard maximum 1).\n"
+                             f"<!-- lab-setting P{pid} KEY={key} FROM={frm} TO={to} -->", edited)
 
 
 def decide(comments, conf=None, done=None, pi=PI):
@@ -75,8 +76,34 @@ class DecideTests(unittest.TestCase):
     def test_edited_proposal_is_refused(self):
         out, done = decide([proposal(1, 1, "HPC_AUTO_SUS_PER_DAY", "10000", "20000", edited=True),
                             comment(2, PI, "approve P1")])
-        self.assertEqual(out, [])
+        self.assertEqual([o[4][:31] for o in out], ["refused: the proposal was edite"])   # reported once, not applied
         self.assertTrue(done["1"].startswith("refused: the proposal was edited"))
+
+    def test_hidden_marker_must_match_visible_text(self):
+        c = comment(1, BOT, "**P1: why**\n\n`HPC_AUTO_SUS_PER_DAY`: 10000 → **12000**\n"
+                            "<!-- lab-setting P1 KEY=HPC_AUTO_SUS_PER_DAY FROM=10000 TO=29000 -->")
+        out, done = decide([c, comment(2, PI, "approve P1")])
+        self.assertEqual([o[4] for o in out], [done["1"]])
+        self.assertIn("visible text", done["1"])
+
+    def test_visible_text_inside_an_html_comment_does_not_count(self):
+        c = comment(1, BOT, "**P1: why** <!-- `HPC_AUTO_SUS_PER_DAY`: 10000 → **29000** -->\n"
+                            "<!-- lab-setting P1 KEY=HPC_AUTO_SUS_PER_DAY FROM=10000 TO=29000 -->")
+        out, _ = decide([c, comment(2, PI, "approve P1")])
+        self.assertIn("visible text", out[0][4])
+
+    def test_set_conf_changes_every_line_of_the_key(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "lab.conf")
+            open(p, "w").write("A=1   # first\nB=2\nA=3\n")
+            saved, apply.CONF = apply.CONF, p
+            try:
+                apply.set_conf("A", "7")
+                self.assertEqual(open(p).read(), "A=7   # first\nB=2\nA=7\n")
+                self.assertEqual(apply.conf_values()["A"], "7")
+            finally:
+                apply.CONF = saved
 
     def test_first_claim_of_a_number_wins(self):
         out, _ = decide([proposal(1, 1, "HPC_AUTO_SUS_PER_DAY", "10000", "20000"),

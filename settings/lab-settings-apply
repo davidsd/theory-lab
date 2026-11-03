@@ -6,6 +6,7 @@ issue (lab-settings-propose); the PI replies `approve P<n>` (or `approve` when o
 `cancel P<n>`. This script, run as root every few minutes, applies a proposal only if:
   - the approval was written by the PI's own GitHub account (PI_GITHUB in lab.conf), after the proposal;
   - the proposal's comment was never edited (the lab's account could otherwise change TO under an approval);
+  - the proposal's visible text states the same key, old and new value as its hidden marker;
   - the key is in /etc/agentbox/settings-max.conf and the new value is a whole number from 0 to that maximum;
   - lab.conf still holds the proposal's FROM value (so a stale proposal can't overwrite a newer change).
 It reads GitHub with a read-only token in /etc/agentbox/settings-gh-token (root only), never anything the lab's accounts
@@ -62,7 +63,7 @@ def set_conf(key, value):
     done = False
     for i, line in enumerate(lines):
         m = re.match(r"(\s*)" + key + r"=[^\s#]*(.*?)(\n?)$", line, re.S)
-        if m and not done:
+        if m:   # every line of the key: the lab's scripts read the last one, conf_values() too
             lines[i] = f"{m[1]}{key}={value}{m[2]}{m[3]}"
             done = True
     if not done:
@@ -83,10 +84,22 @@ def decide(comments, pi, done, maxima, conf):
     proposals = {}                             # P number -> (comment, key, from, to); first claim wins
     out, conf = [], dict(conf)
     for c in sorted(comments, key=lambda c: c["created_at"]):
+        # What the PI sees: the body without HTML comments. A marker counts only if that visible text states the
+        # same key, old and new value (as lab-settings-propose writes it), so a hidden marker can't differ from it.
+        visible = re.sub(r"<!--.*?-->", "", c["body"] or "", flags=re.S)
         for m in PROPOSAL.finditer(c["body"] or ""):
+            if m[1] in proposals:
+                continue
             if c.get("updated_at", c["created_at"]) != c["created_at"]:
-                done.setdefault(m[1], "refused: the proposal was edited after it was posted; propose again")
-            proposals.setdefault(m[1], (c, m[2], m[3], m[4]))
+                bad = "refused: the proposal was edited after it was posted; propose again"
+            elif f"`{m[2]}`: {m[3] or '(unset)'} → **{m[4]}**" not in visible:
+                bad = "refused: the proposal's visible text doesn't match its key and values; propose again"
+            else:
+                bad = None
+            if bad and m[1] not in done:
+                done[m[1]] = bad
+                out.append((m[1], m[2], m[3], m[4], bad, c["html_url"]))
+            proposals[m[1]] = (c, m[2], m[3], m[4])
         if not pi or (c.get("user") or {}).get("login") != pi:
             continue
         v = VERB.match(c["body"] or "")

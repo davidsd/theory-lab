@@ -1,6 +1,6 @@
 # Keys of /etc/agentbox/lab.conf that the PI can change by approving a lab proposal on GitHub (lab-settings-apply),
-# with the hard maximum for each. Installed as /etc/agentbox/settings-max.conf (root-only); edit it with sudo to
-# change the list. A key not listed here can't be changed this way; a value above its maximum is refused.
+# with the hard maximum for each. Installed as /etc/agentbox/settings-max.conf (root-owned, readable by all, since
+# lab-settings-propose checks it too); edit it with sudo to change the list. A key not listed here can't be changed this way; a value above its maximum is refused.
 # The numbers below are examples: set maxima you would be comfortable approving by mistake from your phone,
 # e.g. about three times the values you use now.
 #
