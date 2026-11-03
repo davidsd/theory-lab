@@ -1,0 +1,8 @@
+{
+  "_comment": "Read by lab-arxiv. Categories fetched daily from arXiv's RSS (new and cross-listed papers), and per-project keywords (lowercase, matched in title + abstract) that mark a paper for a closer look. Optional 'strong': keywords that weigh more in the ranking. The director keeps this in step with the projects' charters. A keyword hit is only a pointer: the director reads the hits and decides relevance.",
+  "categories": ["hep-th", "math-ph"],
+  "projects": {
+    "example-project": ["example keyword", "another phrase"]
+  },
+  "strong": []
+}
