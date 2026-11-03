@@ -7,8 +7,8 @@ below are starting guesses, to be replaced by what the PI actually says.
 | Level | Where it goes | Who waits |
 |---|---|---|
 | log | The notebook only | Nobody |
-| digest | The director's daily digest | Nobody |
-| ask | An issue labeled `inbox` + `ask`, assigned to @{{PI}}, stating the default you'll follow | Nobody: carry on with the default |
+| digest | The project's twice-daily summary, and the director's daily digest | Nobody |
+| ask | An issue labeled `inbox` + `ask`, **not assigned** (no email), stating the default you'll follow; the director lists it in the daily digest, and a summary raises it in context | Nobody: carry on with the default |
 | interrupt | An issue labeled `inbox` + `interrupt`; the watchdog pushes it to the PI's phone | Only work that depends on it |
 
 ## Interrupt (rarely: a few times a week across the whole lab)
@@ -27,8 +27,10 @@ below are starting guesses, to be replaced by what the PI actually says.
 - A choice between research directions that the charter doesn't settle.
 - Spending beyond the project's budget, or code ready for one of the PI's repos (with the compare link).
 - New project proposals (the director forwards the good ones).
-- Small cluster jobs held only by a daily limit don't need a question: they are released automatically
-  once they fit again.
+- Parking or dropping a charter direction: the PI's choice, with evidence at a realistic size. Toy
+  negatives reject only the variant tested.
+- Cluster jobs held only by the daily limit don't need a question: they are queued quietly and released
+  automatically once they fit again. Don't cancel and resubmit them.
 
 ## Digest
 
