@@ -1,6 +1,13 @@
 # Settings for the lab: /etc/agentbox/lab.conf. It belongs to root, so agents can't change it; edit it
 # from your own login with `sudo nano /etc/agentbox/lab.conf`. One KEY=value per line, no spaces in
 # values; numbers are plain digits. Changes apply at the next pass or check, without restarting anything.
+#
+# Three layers: the defaults in lib.sh; this file; and /srv/lab/limits.conf, the lab's working values, which
+# the director changes only on your instruction (`lab set <KEY> <value> --reason "..."`; `lab set` alone shows
+# every value, where it comes from and its ceiling). limits.conf may lower anything, and raise a key only up to
+# its ceiling: <KEY>_MAX at the end of this file if there is one, else the value in this file (or the default).
+# From your phone, you can approve changes to this file itself if you install the settings service
+# (install.sh --settings; SETUP.md).
 
 ORG=CHANGE-ME                   # the GitHub organization holding the lab's repos
 PI_GITHUB=CHANGE-ME             # your own GitHub username: only your comments approve things
@@ -19,6 +26,25 @@ CODEX_CREDITS_FLOOR=5000
 # Claude: the lab's share of the plan, which you also use yourself.
 CLAUDE_LAB_RUNS_PER_WEEK=30      # Claude worker/verifier runs per week
 CLAUDE_LAB_STOP_PERCENT=60       # no Claude runs once the plan's weekly usage passes this
+CLAUDE_CREDITS=off               # on: past the stop percent the lab keeps going on the account's usage
+                                 # credits (buy them first); a run that fails for lack of credits pauses
+                                 # Claude for 6 h. The dashboard estimates the balance from what you report.
+CLAUDE_FALLBACK=codex            # when the lab's Claude share is used up, Claude passes run on codex, or wait
+
+# Which model runs what (`lab model ...` changes these in limits.conf on your instruction).
+DEFAULT_MODEL=codex              # agents `lab spawn` starts without --model
+DIRECTOR_MODEL=codex             # the director's passes (each project's lead: `lab model <project> ...`)
+
+# Optional: OpenAI API credits for Codex. Log each lab account in to the API in ~/.codex-api (SETUP.md) and
+# fill in /srv/lab/codex-api-prices.tsv. The lab's API spend stops at the budget; 0 means no API use.
+CODEX_API=off                    # on: once the plan's window is used up, Codex runs go on the API instead of waiting
+CODEX_API_BUDGET_USD=0           # leads may also put a chosen hard task on the API: lab spawn --api "<why>"
+
+# Agents (workers, explorers, verifiers) run as user services in a capped pool, outside Slurm, and put
+# their computations into Slurm (lab-run). AGENT_RUNNER=slurm makes each agent a Slurm job instead.
+AGENT_RUNNER=systemd
+AGENT_POOL_CPUS=4                # CPUs for all of one account's agents together (thinking, git, quick checks)
+AGENT_POOL_MEM_GB=24             # their memory, in GB; leave the rest for Slurm jobs and the system
 
 # Timing
 LEAD_INTERVAL_MIN=20            # how often each lead checks for changes
@@ -33,13 +59,30 @@ HPC_LOGIN_HOST=login.example.edu   # the cluster's ssh login host
 HPC_USER=CHANGE-ME              # your username on the cluster (the lab works under your allocation)
 HPC_SCRATCH_ROOT=/scratch/CHANGE-ME   # your scratch folder there; the lab uses <root>/lab/<project>/
 HPC_HOME_ROOT=/home/CHANGE-ME         # your home there; the lab keeps builds in <root>/lab/<project>/
-HPC_BALANCE_CMD=                # optional: path of a script on the cluster that prints the allocation balance (no spaces)
+HPC_BALANCE_CMD=                # optional: path of a script on the cluster that prints the allocation balance (no spaces);
+                                # the dashboard shows its output
+HPC_SCRATCH_FS=                 # optional (Lustre): the scratch filesystem's mount point, for `lfs quota` on the dashboard
+HPC_SCRATCH_GROUP=              # optional: the Unix group whose scratch quota you share (often the one that matters)
 # Cost model, in SUs (core-hours). Most centers charge core-hours; some partitions charge whole nodes. List those
 # here (comma-separated, empty if none) with the cores per node; check your center's user guide.
 HPC_WHOLE_NODE_PARTITIONS=        # e.g. batch,test
 HPC_CORES_PER_NODE=CHANGE-ME      # cores per node in those partitions
+# Shared partitions: some centers also charge memory, as core-equivalents. HPC_GB_PER_CORE GB of memory count as
+# one core (0: memory isn't charged). If the center's Slurm reports SUs in the job's billing TRES, set how many
+# billing units make one SU-hour (0: not used); the larger estimate counts.
+HPC_GB_PER_CORE=0
+HPC_BILLING_PER_SU=0
 # A job is released automatically only if it fits all of these, and the project's own monthly budget if it
-# has one (`lab budget`); otherwise it waits, held, for your approval.
+# has one (`lab budget`); otherwise it waits, held, for your approval. A job over only the daily limit is
+# queued quietly instead (no question to you) and released as soon as it fits.
 HPC_AUTO_SUS_PER_JOB=2000
 HPC_AUTO_SUS_PER_DAY=10000
 HPC_LAB_SUS_PER_MONTH=50000     # the lab's share of the allocation; the rest stays yours
+
+# Ceilings for the working values in /srv/lab/limits.conf (`lab set`). The lab may set a value up to its
+# ceiling on your instruction; only root raises a ceiling. A key without a _MAX line is capped at its value
+# above (or the default).
+CLAUDE_LAB_STOP_PERCENT_MAX=100
+CLAUDE_LAB_RUNS_PER_WEEK_MAX=300
+AGENT_POOL_CPUS_MAX=8
+AGENT_POOL_MEM_GB_MAX=32

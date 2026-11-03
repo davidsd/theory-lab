@@ -18,10 +18,15 @@ owner=$(jq -r --arg p "$project" '.projects[$p].account // empty' "$LAB/registry
 log=$(ls -t "$PROJECTS/$project"/logs/*-*-"$issue".jsonl 2>/dev/null | head -1 || true)
 [[ -n $log ]] || { echo "No agent has worked on $project #$issue yet." >&2; exit 1; }
 job=$(basename "$log" | cut -d- -f1)
-[[ $job =~ ^[0-9]+$ ]] || { echo "Unexpected log name: $log" >&2; exit 1; }   # job ids reach shell commands below
+[[ $job =~ ^a?[0-9]+$ ]] || { echo "Unexpected log name: $log" >&2; exit 1; }   # job ids reach shell commands below
 dir=$PROJECTS/$project/jobs/$job
 [[ -d $dir ]] || dir=$PROJECTS/$project
-state=$(squeue -h -j "$job" -o %T 2>/dev/null || true)
+if [[ $job =~ ^a[0-9]+$ ]]; then   # an agent outside Slurm: running while its registration's process lives
+  pid=$(jq -r .pid "$LAB/state/agents/$job.json" 2>/dev/null || true)
+  state=""; [[ -n $pid ]] && grep -q "/lab-agent-$job\.service\$" "/proc/$pid/cgroup" 2>/dev/null && state=RUNNING
+else
+  state=$(squeue -h -j "$job" -o %T 2>/dev/null || true)
+fi
 echo "$project #$issue: job $job (${state:-finished}), clone $dir"
 
 as_owner() {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# lab-reload-loops: make the director and lead loops (hpc's, and agent's via lab up) pick up newly
+# installed scripts, without touching any job. For each loop window, wait until it isn't mid-pass
+# (no state/pass-*.running in the lab folder), kill only that tmux window, then `lab up` starts the missing
+# windows again. Never use `lab _stop` for this: it also cancels the project's Slurm jobs.
+set -uo pipefail
+state=${LAB_DIR:-/srv/lab}/state
+for w in $(tmux list-windows -t agents -F '#W' | grep -E '^(director|lead-.+)$'); do
+  if [[ $w == director ]]; then f=$state/pass-director.running; else f=$state/pass-lead-${w#lead-}.running; fi
+  for _ in $(seq 360); do [[ -e $f ]] || break; sleep 10; done   # up to an hour
+  if [[ -e $f ]]; then echo "$w: still mid-pass after an hour; left as it is"; continue; fi
+  tmux kill-window -t "agents:$w" && echo "$w: stopped between passes"
+done
+lab up && echo "lab up: loops restarted with the installed scripts"
+id agent &> /dev/null && sudo -n -H -u agent tmux list-windows -t agents -F '#W' 2>/dev/null | grep -E '^lead-' && echo "(agent-account leads above: reload them the same way as agent if they run)"

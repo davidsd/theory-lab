@@ -6,6 +6,7 @@
 #            session record on this account, and tokens per project from usage/codex-runs.tsv.
 #   Claude:  the plan's usage as last seen by an interactive session's status line, and the lab's
 #            own Claude runs this week (the rest of the plan is the PI's).
+#   OpenAI API: the lab's spend at API prices (usage/codex-api-runs.tsv) against CODEX_API_BUDGET_USD.
 #   HPC: SUs this month per project and for the lab, actual (sacct) where HPC reports them
 #            and estimated otherwise, against the budgets; and, if HPC_BALANCE_CMD is set, the center's report on the allocation.
 set -uo pipefail
@@ -84,6 +85,8 @@ hpc=$(jq -n --argjson s "$sus_by_project" --argjson b "$budgets" --argjson lab "
     month: $month, lab_sus: ([$s[]] | add // 0), lab_budget: $lab, held_jobs: $held, connected: $ok,
     by_project: (($b | map_values(0)) + $s | to_entries | map({(.key): {sus: ($s[.key] // 0), budget: ($b[.key] // null)}}) | add // {})}')
 
+codex=$(jq -c --argjson spent "$(codex_api_spent)" --argjson budget "$CODEX_API_BUDGET_USD" --arg mode "$CODEX_API" \
+  '. + {api: {spent: $spent, budget: $budget, overflow: $mode}}' <<< "$codex")
 jq -n --arg time "$(now)" --argjson codex "$codex" --argjson claude "$claude" --argjson hpc "$hpc" \
   '{time: $time, codex: $codex, claude: $claude, hpc: $hpc}' > "$USAGE/summary.json.new" &&
   mv "$USAGE/summary.json.new" "$USAGE/summary.json"
@@ -92,9 +95,14 @@ jq -n --arg time "$(now)" --argjson codex "$codex" --argjson claude "$claude" --
 {
   echo "Resources as of $(now) (\`lab usage\`):"
   jq -r '.codex.windows[] | "- Codex plan: \(.used_percent)% of the \(if .window_minutes >= 1440 then "\(.window_minutes / 1440)-day" else "\(.window_minutes / 60)-hour" end) window used, \(.elapsed_percent)% of the window elapsed; resets \(.resets_at | strftime("%a %H:%M UTC"))."' "$USAGE/summary.json"
-  echo "- Codex pace: $(codex_pressure) (ok: no limits; ahead: no new explorers; stop: only verifiers start, leads pause)."
+  echo "- Codex pace: $(codex_pressure) (ok: no limits; ahead: no new explorers; stop: only verifiers start, leads pause; api: everything runs, on the OpenAI API)."
+  (( CODEX_API_BUDGET_USD > 0 )) && echo "- OpenAI API: \$$(codex_api_spent) of the lab's \$${CODEX_API_BUDGET_USD} spent; overflow onto the API is ${CODEX_API}$( [[ -f $HOME/.codex-api/auth.json ]] || echo ', but no API login is installed for this account'). Leads may put a chosen hard task on it (lab spawn --api \"<why>\")."
   jq -r '"- Codex tokens in the last 7 days: " + ((.codex.tokens_7d | to_entries | sort_by(-.value) | map("\(.key) \(.value / 1e6 * 10 | floor / 10)M") | join(", ")) // "" | if . == "" then "none recorded" else . end) + "."' "$USAGE/summary.json"
   jq -r '"- Claude: the lab ran \(.claude.lab_runs_7d) of its \(.claude.lab_runs_cap) runs this week" + (if .claude.plan.seven_day then "; the plan is \(.claude.plan.seven_day.used_percentage)% used this week (the lab stops at \(.claude.stop_percent)%)" else "" end) + "."' "$USAGE/summary.json"
+  echo "- Settings (\`lab set\`): Claude stop ${CLAUDE_LAB_STOP_PERCENT}% (${CONF_SRC[CLAUDE_LAB_STOP_PERCENT]}, ceiling ${CONF_CEIL[CLAUDE_LAB_STOP_PERCENT]}%); new agents default to ${DEFAULT_MODEL}; director on ${DIRECTOR_MODEL}; with Claude's share used up, Claude passes $( [[ $CLAUDE_FALLBACK == wait ]] && echo wait || echo 'run on codex')."
+  if [[ $CLAUDE_CREDITS == on ]]; then
+    echo "- Claude credits: on. Past ${CLAUDE_LAB_STOP_PERCENT}% the lab keeps running and Claude Code continues on the account's usage credits$(claude_credits_out && echo '; a run ran out of credits in the last 6 h, so new Claude runs wait')."
+  fi
   jq -r '.hpc | "- HPC this month: \(.lab_sus) of the lab'"'"'s \(.lab_budget) SUs" + (if .held_jobs > 0 then "; \(.held_jobs) jobs held for approval" else "" end) + (if .connected then "" else " (HPC not connected: estimates only)" end) + "."' "$USAGE/summary.json"
   jq -r '.hpc.by_project | to_entries[] | "  - \(.key): \(.value.sus) SUs" + (if .value.budget then " of \(.value.budget)" else "" end)' "$USAGE/summary.json"
 } > "$USAGE/summary.txt.new" && mv "$USAGE/summary.txt.new" "$USAGE/summary.txt"
