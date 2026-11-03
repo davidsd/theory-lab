@@ -7,6 +7,7 @@
 # inbox file state/director-attention.md, which the director reads at the start of every pass. Once per window,
 # when a window resets within 24 h with allowance left, it also asks the director to offer the PI to use it up.
 set -uo pipefail
+export PATH="/usr/local/bin:$PATH"   # from cron, whose PATH lacks it (lab, gh)
 LAB=${LAB_DIR:-/srv/lab}
 U=$LAB/state/usage
 S=$U/summary.json
