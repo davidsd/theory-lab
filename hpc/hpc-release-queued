@@ -110,6 +110,10 @@ def main():
                               capture_output=True, timeout=120).returncode:
                 continue
             f[10] = "auto"   # counts against the limits for the rows after it
+            # Its SUs count from now: the limits sum rows by their epoch (column 1), so a job queued for hours and
+            # counted from its submission would leave the rolling 24-h window early and let up to twice the daily
+            # limit out in 24 h. (Column 2 keeps the submission time.)
+            f[0] = str(int(now))
             done.append(f)
         if done:
             tmp = LEDGER.with_suffix(".tsv.tmp")
